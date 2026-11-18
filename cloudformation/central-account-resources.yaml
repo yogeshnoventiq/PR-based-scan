@@ -1,0 +1,622 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  DevSecOps - PR-Based Security Scanning v3.2
+  Central Account Resources - Centralized Metadata Onboarding
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Organization & Account Configuration"
+        Parameters:
+          - OrganizationId
+          - ExternalAccountIds
+      - Label:
+          default: "VPC Configuration"
+        Parameters:
+          - VpcId
+          - PrivateSubnetIds
+      - Label:
+          default: "SonarQube Configuration"
+        Parameters:
+          - SonarQubeToken
+          - SonarQubeHostUrl
+          - SonarQubeIpCidr
+          - SonarQubePort
+      - Label:
+          default: "Branch Configuration"
+        Parameters:
+          - AllowedBranches
+      - Label:
+          default: "Naming & Tags"
+        Parameters:
+          - ProjectPrefix
+          - Environment
+
+Parameters:
+  OrganizationId:
+    Type: String
+    Description: AWS Organization ID (e.g., o-xxxxxxxxxx). Leave empty if not using Organizations.
+    Default: ""
+    AllowedPattern: "^(o-[a-z0-9]{10,32})?$"
+
+  ExternalAccountIds:
+    Type: CommaDelimitedList
+    Description: Comma-separated list of AWS Account IDs outside your organization.
+    Default: ""
+
+  # ============================================================================
+  # VPC Configuration - Required for CodeBuild to access SonarQube
+  # ============================================================================
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where CodeBuild will run (must have connectivity to SonarQube)
+
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnet IDs for CodeBuild (must have NAT Gateway for internet access)
+
+  AllowedBranches:
+    Type: String
+    Description: Comma-separated list of destination branches that trigger PR scans.
+    Default: "main,uat,master"
+
+  SonarQubeToken:
+    Type: String
+    Description: SonarQube API Token (stored in Secrets Manager)
+    NoEcho: true
+    Default: ""
+
+  SonarQubeHostUrl:
+    Type: String
+    Description: Self-hosted SonarQube URL (e.g., http://10.0.1.50:9000 or https://sonar.internal.com)
+    Default: "http://localhost:9000"
+
+  SonarQubeIpCidr:
+    Type: String
+    Description: SonarQube server IP in CIDR format (e.g., 10.0.1.50/32 for single IP). Used for Security Group egress.
+    AllowedPattern: "^([0-9]{1,3}\\.){3}[0-9]{1,3}/[0-9]{1,2}$"
+    ConstraintDescription: Must be a valid CIDR (e.g., 10.0.1.50/32)
+
+  SonarQubePort:
+    Type: Number
+    Description: SonarQube server port (default 9000, use 443 if behind ALB/TLS)
+    Default: 9000
+    MinValue: 1
+    MaxValue: 65535
+
+  ProjectPrefix:
+    Type: String
+    Description: Prefix for all resource names
+    Default: "pr-scan"
+    AllowedPattern: "^[a-z][a-z0-9-]*$"
+
+  Environment:
+    Type: String
+    Description: Environment name for tagging
+    Default: "shared"
+
+Conditions:
+  HasOrganizationId: !Not [!Equals [!Ref OrganizationId, ""]]
+  HasExternalAccounts: !Not [!Equals [!Join ["", !Ref ExternalAccountIds], ""]]
+  HasSonarToken: !Not [!Equals [!Ref SonarQubeToken, ""]]
+
+Resources:
+
+  # ============================================================================
+  # SECURITY GROUP - CodeBuild in VPC
+  # ============================================================================
+  # 
+  # EGRESS RULES EXPLANATION:
+  # - CodeBuild only needs OUTBOUND (egress) rules to reach external services
+  # - SonarQube: CodeBuild sends scan results TO SonarQube (outbound)
+  # - Internet: Downloads npm, pip, maven packages via NAT Gateway (outbound)
+  # - 0.0.0.0/0 on 443/80 covers both internet AND SonarQube if using those ports
+  # - Explicit SonarQube rule added for clarity and port 9000 (if not using 443)
+  #
+  # ============================================================================
+  CodeBuildSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectPrefix}-codebuild-sg"
+      GroupDescription: Security group for PR Scan CodeBuild project - Egress only
+      VpcId: !Ref VpcId
+      # ========================================================================
+      # EGRESS RULES (Outbound from CodeBuild)
+      # ========================================================================
+      SecurityGroupEgress:
+        # Rule 1: Access to SonarQube server (cross-account, using IP)
+        - IpProtocol: tcp
+          FromPort: !Ref SonarQubePort
+          ToPort: !Ref SonarQubePort
+          CidrIp: !Ref SonarQubeIpCidr
+          Description: !Sub "Outbound to SonarQube server on port ${SonarQubePort}"
+        # Rule 2: HTTPS outbound for internet (npm, pip, maven, sonar-scanner downloads via NAT)
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS outbound for package downloads via NAT Gateway
+        # Rule 3: HTTP outbound (some package registries still use HTTP)
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP outbound via NAT Gateway
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectPrefix}-codebuild-sg"
+        - Key: Purpose
+          Value: PR-Based Security Scanning
+
+  # ============================================================================
+  # NOTE: SonarQube Ingress Rule (Manual Step Required)
+  # ============================================================================
+  # Since SonarQube is in a DIFFERENT AWS account, you must manually add an
+  # inbound rule to SonarQube's Security Group to allow traffic from CodeBuild.
+  # 
+  # In SonarQube's Account, add this inbound rule to SonarQube's SG:
+  #   - Type: Custom TCP
+  #   - Port: 9000 (or 443 if behind ALB)
+  #   - Source: <CodeBuild Private Subnet CIDR> or <NAT Gateway Elastic IP>
+  #   - Description: Allow PR-Scan CodeBuild from Central Account
+  #
+  # If using VPC Peering/Transit Gateway:
+  #   - Source: CIDR of the Central Account's private subnets
+  #
+  # If using PrivateLink:
+  #   - Source: VPC Endpoint Security Group
+  # ============================================================================
+
+  # ============================================================================
+  # EVENTBRIDGE - Custom Event Bus
+  # ============================================================================
+  PRScanEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub "${ProjectPrefix}-events"
+      Tags:
+        - Key: Purpose
+          Value: PR-Based Security Scanning
+        - Key: Version
+          Value: "3.0"
+
+  PRScanEventBusPolicy:
+    Type: AWS::Events::EventBusPolicy
+    Properties:
+      EventBusName: !Ref PRScanEventBus
+      StatementId: AllowCrossAccountPutEvents
+      Statement:
+        Effect: Allow
+        Principal: "*"
+        Action: events:PutEvents
+        Resource: !GetAtt PRScanEventBus.Arn
+        Condition:
+          StringEquals:
+            !If
+              - HasOrganizationId
+              - aws:PrincipalOrgID: !Ref OrganizationId
+              - aws:PrincipalAccount: !Ref ExternalAccountIds
+
+  PRScanEventBusPolicyExternal:
+    Type: AWS::Events::EventBusPolicy
+    Condition: HasExternalAccounts
+    Properties:
+      EventBusName: !Ref PRScanEventBus
+      StatementId: AllowExternalAccountsPutEvents
+      Statement:
+        Effect: Allow
+        Principal: "*"
+        Action: events:PutEvents
+        Resource: !GetAtt PRScanEventBus.Arn
+        Condition:
+          StringEquals:
+            aws:PrincipalAccount: !Ref ExternalAccountIds
+
+  # ============================================================================
+  # EVENTBRIDGE - Rule to Trigger CodeBuild
+  # ============================================================================
+  PRScanTriggerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectPrefix}-trigger"
+      Description: Triggers CodeBuild when PR events are received
+      EventBusName: !Ref PRScanEventBus
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - CodeCommit Pull Request State Change
+        detail:
+          event:
+            - pullRequestCreated
+            - pullRequestSourceBranchUpdated
+      Targets:
+        - Id: TriggerCodeBuild
+          Arn: !GetAtt PRScanCodeBuildProject.Arn
+          RoleArn: !GetAtt EventBridgeCodeBuildRole.Arn
+          InputTransformer:
+            InputPathsMap:
+              pr_id: "$.detail.pullRequestId"
+              repo_name: "$.detail.repositoryNames[0]"
+              source_ref: "$.detail.sourceReference"
+              dest_ref: "$.detail.destinationReference"
+              source_commit: "$.detail.sourceCommit"
+              dest_commit: "$.detail.destinationCommit"
+              source_account: "$.account"
+              event_type: "$.detail.event"
+              author_arn: "$.detail.authorArn"
+              title: "$.detail.title"
+              aws_region: "$.region"
+            InputTemplate: |
+              {
+                "environmentVariablesOverride": [
+                  {"name": "PR_ID", "value": "<pr_id>", "type": "PLAINTEXT"},
+                  {"name": "REPO_NAME", "value": "<repo_name>", "type": "PLAINTEXT"},
+                  {"name": "SOURCE_BRANCH", "value": "<source_ref>", "type": "PLAINTEXT"},
+                  {"name": "DEST_BRANCH", "value": "<dest_ref>", "type": "PLAINTEXT"},
+                  {"name": "SOURCE_COMMIT", "value": "<source_commit>", "type": "PLAINTEXT"},
+                  {"name": "DEST_COMMIT", "value": "<dest_commit>", "type": "PLAINTEXT"},
+                  {"name": "SOURCE_ACCOUNT_ID", "value": "<source_account>", "type": "PLAINTEXT"},
+                  {"name": "EVENT_TYPE", "value": "<event_type>", "type": "PLAINTEXT"},
+                  {"name": "AUTHOR_ARN", "value": "<author_arn>", "type": "PLAINTEXT"},
+                  {"name": "PR_TITLE", "value": "<title>", "type": "PLAINTEXT"},
+                  {"name": "SOURCE_REGION", "value": "<aws_region>", "type": "PLAINTEXT"}
+                ]
+              }
+
+  EventBridgeCodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectPrefix}-eventbridge-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+
+  EventBridgeCodeBuildPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${ProjectPrefix}-eventbridge-policy"
+      Roles:
+        - !Ref EventBridgeCodeBuildRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: codebuild:StartBuild
+            Resource: !GetAtt PRScanCodeBuildProject.Arn
+
+  # ============================================================================
+  # CODEBUILD - PR Security Scan Project (VPC Enabled)
+  # ============================================================================
+  PRScanCodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${ProjectPrefix}-security-scan"
+      Description: PR Security Scanning v3.0 - SonarQube Enterprise (SAST/SCA/Secrets/SBOM)
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      TimeoutInMinutes: 30
+      QueuedTimeoutInMinutes: 60
+      # ========================================================================
+      # VPC CONFIGURATION - Required for SonarQube in Private Subnet
+      # ========================================================================
+      VpcConfig:
+        VpcId: !Ref VpcId
+        Subnets: !Ref PrivateSubnetIds
+        SecurityGroupIds:
+          - !Ref CodeBuildSecurityGroup
+      Source:
+        Type: CODECOMMIT
+        Location: !GetAtt BuildspecRepository.CloneUrlHttp
+        BuildSpec: buildspec/pr-scan-buildspec.yaml
+        GitCloneDepth: 1
+      SourceVersion: refs/heads/master
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: ALLOWED_BRANCHES_PARAM
+            Value: /pr-scan/allowed-branches
+            Type: PLAINTEXT
+          - Name: SONAR_SECRET_ARN
+            Value: !Ref SonarQubeSecret
+            Type: PLAINTEXT
+          - Name: EVIDENCE_BUCKET
+            Value: !Ref EvidenceBucket
+            Type: PLAINTEXT
+          - Name: CENTRAL_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+            Type: PLAINTEXT
+      Artifacts:
+        Type: NO_ARTIFACTS
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref CodeBuildLogGroup
+          StreamName: pr-scan
+      Tags:
+        - Key: Purpose
+          Value: PR-Based Security Scanning
+        - Key: Version
+          Value: "3.2"
+
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub "/aws/codebuild/${ProjectPrefix}-security-scan"
+      RetentionInDays: 30
+
+  # ============================================================================
+  # IAM - CodeBuild Service Role
+  # ============================================================================
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectPrefix}-codebuild-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref CodeBuildServicePolicy
+
+  CodeBuildServicePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${ProjectPrefix}-codebuild-policy"
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CloudWatchLogs
+            Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectPrefix}-security-scan:*"
+          # ====================================================================
+          # VPC PERMISSIONS - Required for CodeBuild to run inside VPC
+          # ====================================================================
+          - Sid: VPCNetworkInterfaces
+            Effect: Allow
+            Action:
+              - ec2:CreateNetworkInterface
+              - ec2:DescribeDhcpOptions
+              - ec2:DescribeNetworkInterfaces
+              - ec2:DeleteNetworkInterface
+              - ec2:DescribeSubnets
+              - ec2:DescribeSecurityGroups
+              - ec2:DescribeVpcs
+            Resource: "*"
+          - Sid: VPCNetworkInterfacePermissions
+            Effect: Allow
+            Action:
+              - ec2:CreateNetworkInterfacePermission
+            Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+            Condition:
+              StringEquals:
+                ec2:AuthorizedService: codebuild.amazonaws.com
+              ArnLike:
+                ec2:Subnet:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/*"
+          - Sid: SSMParameter
+            Effect: Allow
+            Action:
+              - ssm:GetParameter
+              - ssm:GetParameters
+            Resource:
+              - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/pr-scan/*"
+          - Sid: SecretsManager
+            Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+            Resource:
+              - !Ref SonarQubeSecret
+          - Sid: S3Evidence
+            Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt EvidenceBucket.Arn
+              - !Sub "${EvidenceBucket.Arn}/*"
+          - Sid: CodeCommitBuildspec
+            Effect: Allow
+            Action:
+              - codecommit:GitPull
+              - codecommit:GetRepository
+              - codecommit:GetBranch
+            Resource:
+              - !GetAtt BuildspecRepository.Arn
+          - Sid: AssumeRoleInAppAccounts
+            Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Resource:
+              - "arn:aws:iam::*:role/PR-Scan-CodeCommit-Access-Role"
+          - Sid: EventBridgePublish
+            Effect: Allow
+            Action:
+              - events:PutEvents
+            Resource:
+              - !Sub "arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:event-bus/default"
+
+  # ============================================================================
+  # CODECOMMIT - Buildspec + Metadata Repository
+  # ============================================================================
+  BuildspecRepository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Sub "${ProjectPrefix}-buildspecs"
+      RepositoryDescription: |
+        Stores buildspec and onboarded-repos.json for PR security scanning v3.0.
+        Edit onboarded-repos.json to add/remove repositories from scanning.
+      Tags:
+        - Key: Purpose
+          Value: PR-Based Security Scanning
+        - Key: Version
+          Value: "3.0"
+
+  # ============================================================================
+  # S3 - Evidence Bucket
+  # ============================================================================
+  EvidenceBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${ProjectPrefix}-evidence-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldEvidence
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 30
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Purpose
+          Value: PR Security Scan Evidence
+        - Key: Version
+          Value: "3.0"
+
+  # ============================================================================
+  # SSM PARAMETER - Allowed Branches
+  # ============================================================================
+  AllowedBranchesParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /pr-scan/allowed-branches
+      Description: Comma-separated list of branches that trigger PR scans.
+      Type: String
+      Value: !Ref AllowedBranches
+      Tags:
+        Purpose: PR-Based Security Scanning
+
+  # ============================================================================
+  # SECRETS MANAGER - SonarQube Credentials
+  # ============================================================================
+  SonarQubeSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: !Sub "${ProjectPrefix}/sonarqube"
+      Description: SonarQube Enterprise credentials (token + host_url)
+      SecretString: !If
+        - HasSonarToken
+        - !Sub '{"token":"${SonarQubeToken}","host_url":"${SonarQubeHostUrl}"}'
+        - !Sub '{"token":"REPLACE_WITH_TOKEN","host_url":"${SonarQubeHostUrl}"}'
+      Tags:
+        - Key: Purpose
+          Value: PR-Based Security Scanning
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+Outputs:
+  EventBusArn:
+    Description: Event Bus ARN (App Accounts send events here)
+    Value: !GetAtt PRScanEventBus.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-EventBusArn"
+
+  EventBusName:
+    Description: Event Bus Name
+    Value: !Ref PRScanEventBus
+
+  CodeBuildProjectName:
+    Description: CodeBuild project name
+    Value: !Ref PRScanCodeBuildProject
+
+  CodeBuildRoleArn:
+    Description: CodeBuild service role ARN (App Accounts trust this)
+    Value: !GetAtt CodeBuildServiceRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CodeBuildRoleArn"
+
+  CodeBuildSecurityGroupId:
+    Description: CodeBuild Security Group ID (add this to SonarQube SG inbound rules if in same VPC)
+    Value: !Ref CodeBuildSecurityGroup
+
+  VpcId:
+    Description: VPC ID where CodeBuild runs
+    Value: !Ref VpcId
+
+  SonarQubeNetworkConfig:
+    Description: SonarQube network configuration used
+    Value: !Sub "IP: ${SonarQubeIpCidr}, Port: ${SonarQubePort}"
+
+  BuildspecRepositoryCloneUrl:
+    Description: Buildspec repository clone URL
+    Value: !GetAtt BuildspecRepository.CloneUrlHttp
+
+  EvidenceBucketName:
+    Description: S3 evidence bucket name
+    Value: !Ref EvidenceBucket
+
+  SonarSecretArn:
+    Description: SonarQube credentials secret ARN
+    Value: !Ref SonarQubeSecret
+
+  SolutionVersion:
+    Description: Solution version
+    Value: "3.2"
+
+  SetupInstructions:
+    Description: Setup instructions
+    Value: !Sub |
+      === PR SECURITY SCAN v3.0 - SETUP (VPC Enabled) ===
+      
+      NETWORK REQUIREMENTS:
+      - CodeBuild runs in private subnets with NAT Gateway
+      - NAT Gateway required for: npm, pip, maven, sonar-scanner downloads
+      - SonarQube accessible from CodeBuild via VPC Peering/Transit Gateway/Direct Connect
+      
+      MANUAL STEP REQUIRED (SonarQube Account):
+      Add inbound rule to SonarQube's Security Group:
+        - Type: Custom TCP
+        - Port: ${SonarQubePort}
+        - Source: <Central Account Private Subnet CIDR or NAT Gateway EIP>
+        - Description: Allow PR-Scan CodeBuild
+      
+      1. Push buildspec + metadata to CodeCommit:
+         git clone ${BuildspecRepository.CloneUrlHttp}
+         # Copy buildspec/pr-scan-buildspec.yaml
+         # Copy onboarded-repos.json
+         git push origin master
+      
+      2. Deploy app-account-resources.yaml in each App Account:
+         CentralAccountId: ${AWS::AccountId}
+         CentralEventBusArn: ${PRScanEventBus.Arn}
+         CentralCodeBuildRoleArn: ${CodeBuildServiceRole.Arn}
+      
+      3. Onboard repos by editing onboarded-repos.json
+      
+      === ONBOARDING ===
+      Add repo to onboarded-repos.json:
+      {
+        "repo-name": {
+          "appName": "Display Name",
+          "sonarProject": "sonar-project-key",
+          "bu": "Business Unit",
+          "qualityGate": "Sonar way"
+        }
+      }

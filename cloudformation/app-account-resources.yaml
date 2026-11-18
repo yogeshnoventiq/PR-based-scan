@@ -1,0 +1,504 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  DevSecOps - PR-Based Security Scanning
+  Application Account Resources
+  
+  This template creates resources needed in EACH Application Account:
+  - EventBridge Rule (catches PR events for allowed branches only - cost optimized)
+  - IAM Role for EventBridge (send events to Central Event Bus)
+  - IAM Role for CodeCommit Access (allows Central CodeBuild to read/write/approve)
+  - Approval Rule Template (auto-approve PRs when Quality Gate passes)
+  
+  Deploy this stack ONCE per Application Account.
+  No per-repository setup required - all repos are automatically covered.
+  
+  Version: 3.3
+  Author: Noventiq
+  
+  Changes in v3.3:
+  - PR Auto-Approval: Automatically approves PR when Quality Gate passes
+  - Approval Rule Template created for security scan approval
+  - EnableAutoApproval parameter to enable/disable feature
+  
+  Changes in v3.2:
+  - Branch filtering in EventBridge (cost optimization)
+  - Allowed branches configurable via AllowedBranches parameter
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Central Account Configuration"
+        Parameters:
+          - CentralAccountId
+          - CentralEventBusArn
+          - CentralCodeBuildRoleArn
+      - Label:
+          default: "Branch Configuration"
+        Parameters:
+          - AllowedBranches
+      - Label:
+          default: "Auto-Approval Configuration"
+        Parameters:
+          - EnableAutoApproval
+          - ApprovalSessionName
+      - Label:
+          default: "Naming & Tags"
+        Parameters:
+          - ProjectPrefix
+          - Environment
+
+Parameters:
+  CentralAccountId:
+    Type: String
+    Description: AWS Account ID of the Central DevSecOps Account
+    AllowedPattern: "^[0-9]{12}$"
+    ConstraintDescription: Must be a 12-digit AWS Account ID
+
+  CentralEventBusArn:
+    Type: String
+    Description: |
+      ARN of the Central Event Bus (from Central Account stack output).
+      Format: arn:aws:events:REGION:ACCOUNT:event-bus/pr-scan-events
+    AllowedPattern: "^arn:aws:events:[a-z0-9-]+:[0-9]{12}:event-bus/.+$"
+
+  CentralCodeBuildRoleArn:
+    Type: String
+    Description: |
+      ARN of the Central CodeBuild Role (from Central Account stack output).
+      Format: arn:aws:iam::ACCOUNT:role/pr-scan-codebuild-role
+    AllowedPattern: "^arn:aws:iam::[0-9]{12}:role/.+$"
+
+  AllowedBranches:
+    Type: CommaDelimitedList
+    Description: |
+      Comma-separated list of branches (with refs/heads/ prefix) to trigger scans.
+      Only PRs targeting these branches will trigger security scans.
+      Format: refs/heads/branch1,refs/heads/branch2
+    Default: "refs/heads/main,refs/heads/uat,refs/heads/master,refs/heads/dev"
+
+  EnableAutoApproval:
+    Type: String
+    Description: |
+      Enable automatic PR approval when Quality Gate passes.
+      When enabled, PRs that pass security scan will be auto-approved.
+      When disabled, only scan results are posted (no approval).
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+
+  ApprovalSessionName:
+    Type: String
+    Description: |
+      Session name used when approving PRs. This identifies the approver.
+      Must match the session name used in buildspec when assuming role.
+    Default: "SecurityScanner"
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9-_]*$"
+
+  ProjectPrefix:
+    Type: String
+    Description: Prefix for all resource names
+    Default: "pr-scan"
+    AllowedPattern: "^[a-z][a-z0-9-]*$"
+
+  Environment:
+    Type: String
+    Description: Environment name for tagging
+    Default: "prod"
+
+Conditions:
+  CreateApprovalTemplate: !Equals [!Ref EnableAutoApproval, "true"]
+
+Resources:
+
+  # ============================================================================
+  # EVENTBRIDGE - Rule to Forward PR Events to Central Account
+  # ============================================================================
+  # NOTE: Only PRs targeting allowed branches will trigger the security scan.
+  # This saves compute cost by filtering at EventBridge level.
+  #
+  # Branches are configured via AllowedBranches parameter.
+  # ============================================================================
+  PREventForwarderRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectPrefix}-event-forwarder"
+      Description: |
+        Catches CodeCommit PR events for allowed branches and forwards to Central Event Bus.
+        Branches configured via AllowedBranches parameter.
+        Version: 3.2 - Cost optimized with branch filtering.
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - CodeCommit Pull Request State Change
+        detail:
+          event:
+            - pullRequestCreated
+            - pullRequestSourceBranchUpdated
+          destinationReference: !Ref AllowedBranches
+      Targets:
+        - Id: ForwardToCentralEventBus
+          Arn: !Ref CentralEventBusArn
+          RoleArn: !GetAtt EventBridgeForwarderRole.Arn
+
+  # ============================================================================
+  # IAM - EventBridge Forwarder Role
+  # ============================================================================
+  EventBridgeForwarderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectPrefix}-eventbridge-forwarder-role"
+      Description: Allows EventBridge to send PR events to Central Account Event Bus
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Purpose
+          Value: PR-Based Security Scanning
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Version
+          Value: "3.2"
+
+  EventBridgeForwarderPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${ProjectPrefix}-eventbridge-forwarder-policy"
+      Description: Allows EventBridge to forward events to Central Account
+      Roles:
+        - !Ref EventBridgeForwarderRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: events:PutEvents
+            Resource: !Ref CentralEventBusArn
+
+  # ============================================================================
+  # IAM - CodeCommit Access Role (for Central CodeBuild)
+  # ============================================================================
+  CodeCommitAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: PR-Scan-CodeCommit-Access-Role
+      Description: |
+        Allows Central Account CodeBuild to:
+        - Clone source code from CodeCommit repositories
+        - Post PR comments with scan results (v2.1)
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Ref CentralCodeBuildRoleArn
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Sub "${ProjectPrefix}-cross-account"
+      Tags:
+        - Key: Purpose
+          Value: PR-Based Security Scanning
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CentralAccount
+          Value: !Ref CentralAccountId
+        - Key: Version
+          Value: "3.2"
+
+  CodeCommitAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${ProjectPrefix}-codecommit-access-policy"
+      Description: Permissions for Central CodeBuild to access CodeCommit (v3.2)
+      Roles:
+        - !Ref CodeCommitAccessRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Read repositories (for cloning source code)
+          - Sid: CodeCommitRead
+            Effect: Allow
+            Action:
+              - codecommit:GitPull
+              - codecommit:GetRepository
+              - codecommit:GetBranch
+              - codecommit:GetCommit
+              - codecommit:BatchGetCommits
+              - codecommit:GetFile
+              - codecommit:GetFolder
+              - codecommit:ListRepositories
+            Resource: !Sub "arn:${AWS::Partition}:codecommit:${AWS::Region}:${AWS::AccountId}:*"
+          
+          # Read PR details
+          - Sid: PullRequestRead
+            Effect: Allow
+            Action:
+              - codecommit:GetPullRequest
+              - codecommit:GetCommentsForPullRequest
+              - codecommit:GetPullRequestApprovalStates
+              - codecommit:GetPullRequestOverrideState
+            Resource: !Sub "arn:${AWS::Partition}:codecommit:${AWS::Region}:${AWS::AccountId}:*"
+          
+          # Post PR comments (for scan results)
+          - Sid: PullRequestComment
+            Effect: Allow
+            Action:
+              - codecommit:PostCommentForPullRequest
+              - codecommit:PostCommentForComparedCommit
+              - codecommit:PostCommentReply
+              - codecommit:UpdateComment
+              - codecommit:DeleteCommentContent
+            Resource: !Sub "arn:${AWS::Partition}:codecommit:${AWS::Region}:${AWS::AccountId}:*"
+          
+          # Approve PRs (for auto-approval when Quality Gate passes)
+          - Sid: PullRequestApproval
+            Effect: Allow
+            Action:
+              - codecommit:UpdatePullRequestApprovalState
+            Resource: !Sub "arn:${AWS::Partition}:codecommit:${AWS::Region}:${AWS::AccountId}:*"
+
+  # ============================================================================
+  # APPROVAL RULE TEMPLATE - Lambda Custom Resource
+  # ============================================================================
+  # AWS CloudFormation does NOT natively support AWS::CodeCommit::ApprovalRuleTemplate
+  # This Lambda-backed Custom Resource creates/updates/deletes the template via API.
+  #
+  # The Lambda runs ONLY during stack operations (CREATE/UPDATE/DELETE).
+  # Cost: ~$0.001 per stack operation (negligible).
+  # ============================================================================
+
+  # IAM Role for the Custom Resource Lambda
+  ApprovalTemplateLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: CreateApprovalTemplate
+    Properties:
+      RoleName: !Sub "${ProjectPrefix}-approval-template-lambda-role"
+      Description: IAM role for Lambda that manages CodeCommit Approval Rule Template
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: CodeCommitApprovalTemplatePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codecommit:CreateApprovalRuleTemplate
+                  - codecommit:UpdateApprovalRuleTemplateContent
+                  - codecommit:UpdateApprovalRuleTemplateDescription
+                  - codecommit:UpdateApprovalRuleTemplateName
+                  - codecommit:DeleteApprovalRuleTemplate
+                  - codecommit:GetApprovalRuleTemplate
+                Resource: "*"
+      Tags:
+        - Key: Purpose
+          Value: PR-Based Security Scanning
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Function to manage Approval Rule Template
+  ApprovalTemplateLambda:
+    Type: AWS::Lambda::Function
+    Condition: CreateApprovalTemplate
+    Properties:
+      FunctionName: !Sub "${ProjectPrefix}-approval-template-manager"
+      Description: Creates/Updates/Deletes CodeCommit Approval Rule Template for PR auto-approval
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt ApprovalTemplateLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import json
+          
+          codecommit = boto3.client('codecommit')
+          
+          def handler(event, context):
+              print(f"Event: {json.dumps(event)}")
+              
+              request_type = event['RequestType']
+              props = event['ResourceProperties']
+              
+              template_name = props['TemplateName']
+              template_content = props['TemplateContent']
+              template_description = props.get('TemplateDescription', 'Auto-approval for PR security scans')
+              
+              try:
+                  if request_type == 'Create':
+                      # Create new approval rule template
+                      response = codecommit.create_approval_rule_template(
+                          approvalRuleTemplateName=template_name,
+                          approvalRuleTemplateContent=template_content,
+                          approvalRuleTemplateDescription=template_description
+                      )
+                      template_id = response['approvalRuleTemplate']['approvalRuleTemplateId']
+                      print(f"Created approval rule template: {template_name} (ID: {template_id})")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'TemplateId': template_id,
+                          'TemplateName': template_name
+                      }, template_id)
+                  
+                  elif request_type == 'Update':
+                      # Update existing template
+                      old_props = event.get('OldResourceProperties', {})
+                      old_name = old_props.get('TemplateName', template_name)
+                      
+                      # Update content
+                      codecommit.update_approval_rule_template_content(
+                          approvalRuleTemplateName=old_name,
+                          newRuleContent=template_content
+                      )
+                      
+                      # Update description
+                      codecommit.update_approval_rule_template_description(
+                          approvalRuleTemplateName=old_name,
+                          approvalRuleTemplateDescription=template_description
+                      )
+                      
+                      # Update name if changed
+                      if old_name != template_name:
+                          codecommit.update_approval_rule_template_name(
+                              oldApprovalRuleTemplateName=old_name,
+                              newApprovalRuleTemplateName=template_name
+                          )
+                      
+                      print(f"Updated approval rule template: {template_name}")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'TemplateName': template_name
+                      }, event.get('PhysicalResourceId'))
+                  
+                  elif request_type == 'Delete':
+                      # Delete template (ignore if not found)
+                      try:
+                          codecommit.delete_approval_rule_template(
+                              approvalRuleTemplateName=template_name
+                          )
+                          print(f"Deleted approval rule template: {template_name}")
+                      except codecommit.exceptions.ApprovalRuleTemplateDoesNotExistException:
+                          print(f"Template {template_name} does not exist, nothing to delete")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, event.get('PhysicalResourceId'))
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+      Tags:
+        - Key: Purpose
+          Value: PR-Based Security Scanning
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Custom Resource to create the Approval Rule Template
+  ApprovalRuleTemplate:
+    Type: Custom::ApprovalRuleTemplate
+    Condition: CreateApprovalTemplate
+    Properties:
+      ServiceToken: !GetAtt ApprovalTemplateLambda.Arn
+      TemplateName: !Sub "${ProjectPrefix}-SecurityScanApproval"
+      TemplateDescription: "Auto-approval for PR security scans. PRs are approved when Quality Gate passes. Created by DevSecOps v3.3."
+      TemplateContent: !Sub |
+        {"Version":"2018-11-08","Statements":[{"Type":"Approvers","NumberOfApprovalsNeeded":1,"ApprovalPoolMembers":["arn:aws:sts::${AWS::AccountId}:assumed-role/PR-Scan-CodeCommit-Access-Role/${ApprovalSessionName}"]}]}
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+Outputs:
+  EventForwarderRuleArn:
+    Description: ARN of the EventBridge Rule that forwards PR events
+    Value: !GetAtt PREventForwarderRule.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-EventForwarderRuleArn"
+
+  EventForwarderRoleName:
+    Description: Name of the EventBridge forwarder IAM role
+    Value: !Ref EventBridgeForwarderRole
+    Export:
+      Name: !Sub "${AWS::StackName}-EventForwarderRoleName"
+
+  CodeCommitAccessRoleArn:
+    Description: ARN of the CodeCommit Access Role (Central CodeBuild uses this)
+    Value: !GetAtt CodeCommitAccessRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CodeCommitAccessRoleArn"
+
+  CodeCommitAccessRoleName:
+    Description: Name of the CodeCommit Access Role
+    Value: !Ref CodeCommitAccessRole
+    Export:
+      Name: !Sub "${AWS::StackName}-CodeCommitAccessRoleName"
+
+  SolutionVersion:
+    Description: Version of the PR-Based Security Scanning solution
+    Value: "3.3"
+
+  AllowedBranchesInfo:
+    Description: Branches that trigger security scans (from AllowedBranches parameter)
+    Value: !Join [", ", !Ref AllowedBranches]
+
+  AutoApprovalEnabled:
+    Description: Whether auto-approval is enabled
+    Value: !Ref EnableAutoApproval
+
+  ApprovalRuleTemplateName:
+    Condition: CreateApprovalTemplate
+    Description: Name of the Approval Rule Template (created automatically)
+    Value: !Sub "${ProjectPrefix}-SecurityScanApproval"
+
+  ApprovalRuleTemplateId:
+    Condition: CreateApprovalTemplate
+    Description: ID of the Approval Rule Template
+    Value: !GetAtt ApprovalRuleTemplate.TemplateId
+
+  SetupComplete:
+    Description: Setup completion message
+    Value: !Sub |
+      =====================================================
+      APP ACCOUNT SETUP COMPLETE: ${AWS::AccountId} (v3.3)
+      =====================================================
+      
+      Resources Created:
+      - EventBridge Rule: ${PREventForwarderRule}
+      - EventBridge Role: ${EventBridgeForwarderRole}
+      - CodeCommit Access Role: ${CodeCommitAccessRole.Arn}
+      - Approval Rule Template: ${ProjectPrefix}-SecurityScanApproval ✅
+      
+      FEATURES:
+      ✅ Branch filtering (cost optimization)
+      ✅ Auto-approval when Quality Gate passes
+      
+      =====================================================
+      NEXT STEP: Associate Template with Repositories
+      =====================================================
+      
+      To enable auto-approval, associate the template with your repos:
+      
+      # Single repository
+      aws codecommit associate-approval-rule-template-with-repository \
+        --approval-rule-template-name "${ProjectPrefix}-SecurityScanApproval" \
+        --repository-name "YOUR-REPO-NAME"
+      
+      # Multiple repositories
+      aws codecommit batch-associate-approval-rule-template-with-repositories \
+        --approval-rule-template-name "${ProjectPrefix}-SecurityScanApproval" \
+        --repository-names "repo1" "repo2" "repo3"
+      
+      # List all repositories (to see available repos)
+      aws codecommit list-repositories --query 'repositories[].repositoryName'
+      
+      =====================================================

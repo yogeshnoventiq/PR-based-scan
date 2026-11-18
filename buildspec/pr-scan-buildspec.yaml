@@ -1,0 +1,866 @@
+version: 0.2
+# DevSecOps - PR Security Scan v3.3
+# Uses Self-Hosted SonarQube Enterprise with Advanced Security
+# Full Scan: SAST + SCA + Secrets (SBOM via SonarQube Advanced Security)
+#
+# v3.3: Auto-Approval when Quality Gate passes
+#       - Uses fixed session name "SecurityScanner" for approval
+#       - Auto-approves PR when Quality Gate passes
+#       - No approval when Quality Gate fails/warning
+#
+# v3.2: Minimal dependencies - No pip install needed
+#       - Removed runtime-versions (uses CodeBuild defaults)
+#       - Uses AWS credential-helper instead of git-remote-codecommit
+#       - Only 4 domains to whitelist
+#
+# v3.1: Removed CycloneDX (SonarQube Advanced Security handles SBOM)
+# v3.0: Centralized metadata onboarding (onboarded-repos.json)
+
+env:
+  variables:
+    PR_ID: ""
+    REPO_NAME: ""
+    SOURCE_BRANCH: ""
+    DEST_BRANCH: ""
+    SOURCE_COMMIT: ""
+    DEST_COMMIT: ""
+    SOURCE_ACCOUNT_ID: ""
+    SOURCE_REGION: "ap-south-1"
+    # Auto-Approval settings (v3.3)
+    ENABLE_AUTO_APPROVAL: "true"          # Set to "false" to disable
+    APPROVAL_SESSION_NAME: "SecurityScanner"  # Must match CloudFormation ApprovalSessionName
+
+phases:
+  install:
+    # No runtime-versions needed - CodeBuild image has Java (corretto17) pre-installed
+    # sonar-scanner requires Java which is available by default
+    commands:
+      - echo "=== DevSecOps PR Scan v3.3 (SonarQube Enterprise + Advanced Security) ==="
+      - |
+        # Fetch SonarQube credentials from Secrets Manager
+        echo "Fetching SonarQube credentials..."
+        SONAR_SECRET=$(aws secretsmanager get-secret-value --secret-id "$SONAR_SECRET_ARN" --query SecretString --output text 2>&1) || {
+          echo "[ERROR] Failed to fetch SonarQube secret: $SONAR_SECRET"
+          exit 1
+        }
+        export SONAR_TOKEN=$(echo "$SONAR_SECRET" | jq -r '.token')
+        export SONAR_HOST_URL=$(echo "$SONAR_SECRET" | jq -r '.host_url')
+        
+        if [ -z "$SONAR_TOKEN" ] || [ "$SONAR_TOKEN" = "null" ]; then
+          echo "[ERROR] SONAR_TOKEN is empty or null in secret"
+          exit 1
+        fi
+        if [ -z "$SONAR_HOST_URL" ] || [ "$SONAR_HOST_URL" = "null" ]; then
+          echo "[ERROR] SONAR_HOST_URL is empty or null in secret"
+          exit 1
+        fi
+        
+        # Mask token in logs (show only last 4 chars)
+        TOKEN_MASKED="***${SONAR_TOKEN: -4}"
+        echo "SonarQube Host: $SONAR_HOST_URL"
+        echo "SonarQube Token: $TOKEN_MASKED"
+        
+        # Test SonarQube connectivity
+        echo "Testing SonarQube connectivity..."
+        SONAR_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/system/status" 2>&1) || SONAR_STATUS="000"
+        if [ "$SONAR_STATUS" = "200" ]; then
+          echo "✅ SonarQube connection successful (HTTP $SONAR_STATUS)"
+        elif [ "$SONAR_STATUS" = "401" ]; then
+          echo "[ERROR] SonarQube authentication failed (HTTP 401) - Token may be invalid or expired"
+          echo "Please verify the token in Secrets Manager: $SONAR_SECRET_ARN"
+          exit 1
+        elif [ "$SONAR_STATUS" = "000" ]; then
+          echo "[ERROR] Cannot connect to SonarQube at $SONAR_HOST_URL - Network/Firewall issue"
+          exit 1
+        else
+          echo "⚠️ SonarQube returned HTTP $SONAR_STATUS - proceeding anyway"
+        fi
+        
+        # Save credentials for other phases (CodeBuild env vars don't persist between command blocks)
+        echo "$SONAR_TOKEN" > /tmp/sonar_token
+        echo "$SONAR_HOST_URL" > /tmp/sonar_host_url
+      - |
+        # Load SonarQube credentials
+        export SONAR_TOKEN=$(cat /tmp/sonar_token)
+        export SONAR_HOST_URL=$(cat /tmp/sonar_host_url)
+        
+        if [ -z "$PR_ID" ] || [ -z "$REPO_NAME" ] || [ -z "$SOURCE_ACCOUNT_ID" ]; then
+          echo "[ERROR] Missing required variables"; exit 1
+        fi
+        
+        export SOURCE_BRANCH_CLEAN=$(echo "$SOURCE_BRANCH" | sed 's|refs/heads/||')
+        export DEST_BRANCH_CLEAN=$(echo "$DEST_BRANCH" | sed 's|refs/heads/||')
+        echo "PR #${PR_ID}: ${SOURCE_BRANCH_CLEAN} → ${DEST_BRANCH_CLEAN}"
+        
+        # Check allowed branches
+        ALLOWED_BRANCHES=$(aws ssm get-parameter --name "${ALLOWED_BRANCHES_PARAM:-/pr-scan/allowed-branches}" --query 'Parameter.Value' --output text 2>/dev/null || echo "main,uat,master")
+        BRANCH_ALLOWED="false"
+        IFS=',' read -ra BRANCH_LIST <<< "$ALLOWED_BRANCHES"
+        for branch in "${BRANCH_LIST[@]}"; do
+          [ "$(echo $branch | xargs)" = "$DEST_BRANCH_CLEAN" ] && BRANCH_ALLOWED="true" && break
+        done
+        
+        if [ "$BRANCH_ALLOWED" = "false" ]; then
+          echo "[SKIP] Branch '$DEST_BRANCH_CLEAN' not in allowed list: $ALLOWED_BRANCHES"
+          echo "SKIP" > /tmp/scan_status
+          echo "BRANCH_NOT_ALLOWED" > /tmp/skip_reason
+          exit 0
+        fi
+        
+        export SCAN_TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
+        export SCAN_START_TIME=$(date +%s)
+        mkdir -p /tmp/evidence /tmp/source
+        echo "false" > /tmp/technical_error
+        
+        # Install tools (minimal)
+        wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.40.5/yq_linux_amd64 && chmod +x /usr/local/bin/yq
+        which jq >/dev/null 2>&1 || yum install -y jq 2>/dev/null || true
+        
+        # SonarScanner 8.x for SonarQube 10.x+ (version 2026.x)
+        wget -q https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-8.1.0.6389-linux-x64.zip && \
+          unzip -q sonar-scanner-cli-8.1.0.6389-linux-x64.zip && mv sonar-scanner-8.1.0.6389-linux-x64 /opt/sonar-scanner && chmod +x /opt/sonar-scanner/bin/sonar-scanner
+
+  pre_build:
+    commands:
+      - echo "=== Pre-Build - Onboarding Check & Configuration ==="
+      - |
+        [ -f /tmp/scan_status ] && [ "$(cat /tmp/scan_status)" = "SKIP" ] && exit 0
+        
+        # Load SonarQube credentials
+        export SONAR_TOKEN=$(cat /tmp/sonar_token)
+        export SONAR_HOST_URL=$(cat /tmp/sonar_host_url)
+        
+        # ================================================================
+        # CENTRALIZED ONBOARDING CHECK (v3.0)
+        # ================================================================
+        
+        METADATA_FILE="${CODEBUILD_SRC_DIR}/onboarded-repos.json"
+        
+        if [ ! -f "$METADATA_FILE" ]; then
+          echo "[ERROR] Metadata file not found: $METADATA_FILE"
+          echo "true" > /tmp/technical_error
+          echo "Metadata file missing" > /tmp/error_message
+          exit 0
+        fi
+        
+        # Check if repo is onboarded
+        REPO_CONFIG=$(jq -r ".repositories[\"${REPO_NAME}\"] // empty" "$METADATA_FILE")
+        
+        if [ -z "$REPO_CONFIG" ]; then
+          echo ""
+          echo "========================================================"
+          echo "[SKIP] Repository '$REPO_NAME' is NOT onboarded"
+          echo "========================================================"
+          echo ""
+          echo "This repository is not listed in onboarded-repos.json."
+          echo ""
+          echo "To onboard this repository:"
+          echo "  1. Edit onboarded-repos.json in pr-scan-buildspecs repo"
+          echo "  2. Add entry for '$REPO_NAME' with required fields"
+          echo "  3. Commit and push"
+          echo ""
+          echo "Example entry:"
+          echo "  \"$REPO_NAME\": {"
+          echo "    \"appName\": \"Application Display Name\","
+          echo "    \"sonarProject\": \"$REPO_NAME\","
+          echo "    \"lang\": \"nodejs\","
+          echo "    \"bu\": \"Business Unit\","
+          echo "    \"sbu\": \"Sub Business Unit\","
+          echo "    \"qualityGate\": \"Sonar way\""
+          echo "  }"
+          echo ""
+          echo "========================================================"
+          echo "SKIP" > /tmp/scan_status
+          echo "NOT_ONBOARDED" > /tmp/skip_reason
+          exit 0
+        fi
+        
+        echo "Repository '$REPO_NAME' is onboarded. Loading configuration..."
+        
+        # ================================================================
+        # LOAD CONFIGURATION FROM METADATA
+        # ================================================================
+        
+        APP_ID="$REPO_NAME"
+        APP_NAME=$(echo "$REPO_CONFIG" | jq -r '.appName // ""')
+        SONAR_PROJECT=$(echo "$REPO_CONFIG" | jq -r '.sonarProject // ""')
+        REPO_LANGUAGE=$(echo "$REPO_CONFIG" | jq -r '.lang // ""')
+        BU=$(echo "$REPO_CONFIG" | jq -r '.bu // ""')
+        SBU=$(echo "$REPO_CONFIG" | jq -r '.sbu // ""')
+        QUALITY_GATE_NAME=$(echo "$REPO_CONFIG" | jq -r '.qualityGate // ""')
+        
+        # If sonarProject not specified, use repo-accountId format
+        if [ -z "$SONAR_PROJECT" ] || [ "$SONAR_PROJECT" = "null" ]; then
+          PROJECT_KEY="${REPO_NAME}-${SOURCE_ACCOUNT_ID}"
+          echo "Using account-specific SonarQube project: $PROJECT_KEY"
+        else
+          PROJECT_KEY="$SONAR_PROJECT"
+          echo "Using shared SonarQube project: $PROJECT_KEY (cost optimized)"
+        fi
+        
+        # ================================================================
+        # CLONE SOURCE REPOSITORY (Using AWS Credential Helper - No Python)
+        # ================================================================
+        
+        ROLE_ARN="arn:aws:iam::${SOURCE_ACCOUNT_ID}:role/PR-Scan-CodeCommit-Access-Role"
+        CREDENTIALS=$(aws sts assume-role --role-arn "$ROLE_ARN" --role-session-name "pr-scan-${PR_ID}" \
+          --external-id "pr-scan-cross-account" --duration-seconds 3600 --query 'Credentials' --output json 2>&1) || {
+          echo "[ERROR] Role assumption failed"; echo "true" > /tmp/technical_error; echo "Role assumption failed" > /tmp/error_message; exit 0
+        }
+        
+        export APP_AWS_ACCESS_KEY_ID=$(echo "$CREDENTIALS" | jq -r '.AccessKeyId')
+        export APP_AWS_SECRET_ACCESS_KEY=$(echo "$CREDENTIALS" | jq -r '.SecretAccessKey')
+        export APP_AWS_SESSION_TOKEN=$(echo "$CREDENTIALS" | jq -r '.SessionToken')
+        
+        # Configure git credential helper (no Python pip install needed)
+        export AWS_ACCESS_KEY_ID="$APP_AWS_ACCESS_KEY_ID"
+        export AWS_SECRET_ACCESS_KEY="$APP_AWS_SECRET_ACCESS_KEY"
+        export AWS_SESSION_TOKEN="$APP_AWS_SESSION_TOKEN"
+        
+        git config --global credential.helper '!aws codecommit credential-helper $@'
+        git config --global credential.UseHttpPath true
+        
+        REPO_URL="https://git-codecommit.${SOURCE_REGION}.amazonaws.com/v1/repos/${REPO_NAME}"
+        git clone "$REPO_URL" /tmp/source 2>&1 || {
+          echo "[ERROR] Clone failed"; echo "true" > /tmp/technical_error; echo "Clone failed" > /tmp/error_message
+          unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN; exit 0
+        }
+        cd /tmp/source && git checkout "$SOURCE_COMMIT" 2>/dev/null || true
+        unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+        
+        # ================================================================
+        # LANGUAGE (from onboarding metadata)
+        # ================================================================
+        
+        # Use language from onboarded-repos.json, fallback to 'generic' if not specified
+        if [ -n "$REPO_LANGUAGE" ] && [ "$REPO_LANGUAGE" != "null" ]; then
+          DETECTED_LANGUAGE="$REPO_LANGUAGE"
+        else
+          DETECTED_LANGUAGE="generic"
+        fi
+        
+        # ================================================================
+        # SET QUALITY GATE (if specified in metadata)
+        # ================================================================
+        
+        if [ -n "$QUALITY_GATE_NAME" ] && [ "$QUALITY_GATE_NAME" != "null" ]; then
+          echo "Setting Quality Gate to: $QUALITY_GATE_NAME"
+          GATE_ID=$(curl -s -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/qualitygates/list" | jq -r ".qualitygates[]|select(.name==\"${QUALITY_GATE_NAME}\")|.id" 2>/dev/null)
+          if [ -n "$GATE_ID" ] && [ "$GATE_ID" != "null" ]; then
+            curl -s -X POST -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/qualitygates/select?projectKey=${PROJECT_KEY}&gateId=${GATE_ID}" >/dev/null 2>&1
+            echo "Quality Gate '$QUALITY_GATE_NAME' applied to project"
+          else
+            echo "Quality Gate '$QUALITY_GATE_NAME' not found in SonarQube, using project default"
+            QUALITY_GATE_NAME="(project default)"
+          fi
+        else
+          QUALITY_GATE_NAME="(project default)"
+          echo "Using SonarQube project default Quality Gate"
+        fi
+        
+        CORRELATION_ID="${APP_ID}-PR${PR_ID}-${SCAN_TIMESTAMP}"
+        
+        # Print configuration summary
+        echo ""
+        echo "=========================================="
+        echo "CONFIGURATION SUMMARY (v3.2)"
+        echo "=========================================="
+        echo "Repository:    $REPO_NAME"
+        echo "App ID:        $APP_ID"
+        [ -n "$APP_NAME" ] && [ "$APP_NAME" != "null" ] && echo "App Name:      $APP_NAME"
+        [ -n "$BU" ] && [ "$BU" != "null" ] && echo "BU:            $BU"
+        [ -n "$SBU" ] && [ "$SBU" != "null" ] && echo "SBU:           $SBU"
+        echo "Language:      $DETECTED_LANGUAGE"
+        echo "SonarQube:     $PROJECT_KEY"
+        echo "Quality Gate:  $QUALITY_GATE_NAME"
+        echo "SonarQube URL: $SONAR_HOST_URL"
+        echo "Scan Type:     Full (SAST + SCA + Secrets + SBOM via SonarQube)"
+        echo "=========================================="
+        echo ""
+        
+        # Save configuration
+        echo "$APP_ID" > /tmp/app_id
+        echo "$APP_NAME" > /tmp/app_name
+        echo "$BU" > /tmp/bu
+        echo "$SBU" > /tmp/sbu
+        echo "$DETECTED_LANGUAGE" > /tmp/app_type
+        echo "$CORRELATION_ID" > /tmp/correlation_id
+        echo "$PROJECT_KEY" > /tmp/project_key
+        echo "$QUALITY_GATE_NAME" > /tmp/qg_name
+        echo "$SOURCE_BRANCH_CLEAN" > /tmp/source_branch_clean
+
+  build:
+    commands:
+      - echo "=== Build - Security Scanning ==="
+      - |
+        [ -f /tmp/scan_status ] && [ "$(cat /tmp/scan_status)" = "SKIP" ] && exit 0
+        [ "$(cat /tmp/technical_error 2>/dev/null)" = "true" ] && exit 0
+        
+        # Load SonarQube credentials
+        export SONAR_TOKEN=$(cat /tmp/sonar_token)
+        export SONAR_HOST_URL=$(cat /tmp/sonar_host_url)
+        
+        cd /tmp/source
+        APP_ID=$(cat /tmp/app_id)
+        PROJECT_KEY=$(cat /tmp/project_key)
+        CORRELATION_ID=$(cat /tmp/correlation_id)
+        DETECTED_LANGUAGE=$(cat /tmp/app_type)
+        SOURCE_BRANCH_CLEAN=$(cat /tmp/source_branch_clean 2>/dev/null || echo "main")
+        
+        # ================================================================
+        # SONARQUBE SCAN (Full: SAST + SCA + Secrets + SBOM)
+        # SonarQube Advanced Security handles all security scanning
+        # ================================================================
+        
+        echo "Running SonarQube scan (SAST + SCA + Secrets + SBOM)..."
+        SCAN_STATUS="UNKNOWN"
+        SCANNER_QG_STATUS="UNKNOWN"
+        
+        EXCLUSIONS="node_modules/**,coverage/**,.git/**,vendor/**,target/**,dist/**,build/**,**/*.min.js,**/*.min.css"
+        
+        # Debug: Verify token is loaded correctly
+        echo "Debug: SONAR_HOST_URL=$SONAR_HOST_URL"
+        echo "Debug: SONAR_TOKEN length=$(echo -n "$SONAR_TOKEN" | wc -c) chars"
+        echo "Debug: SONAR_TOKEN last4=***${SONAR_TOKEN: -4}"
+        
+        # Test token one more time right before scanner
+        TEST_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/system/status")
+        echo "Debug: Pre-scan API test result: HTTP $TEST_STATUS"
+        
+        # Build scanner parameters - pass token explicitly (like SonarCloud)
+        SONAR_PARAMS="-Dsonar.projectKey=$PROJECT_KEY"
+        SONAR_PARAMS="$SONAR_PARAMS -Dsonar.projectName=$APP_ID"
+        SONAR_PARAMS="$SONAR_PARAMS -Dsonar.sources=."
+        SONAR_PARAMS="$SONAR_PARAMS -Dsonar.host.url=$SONAR_HOST_URL"
+        SONAR_PARAMS="$SONAR_PARAMS -Dsonar.token=$SONAR_TOKEN"
+        SONAR_PARAMS="$SONAR_PARAMS -Dsonar.qualitygate.wait=true"
+        SONAR_PARAMS="$SONAR_PARAMS -Dsonar.qualitygate.timeout=300"
+        SONAR_PARAMS="$SONAR_PARAMS -Dsonar.branch.name=$SOURCE_BRANCH_CLEAN"
+        SONAR_PARAMS="$SONAR_PARAMS -Dsonar.exclusions=$EXCLUSIONS"
+        SONAR_PARAMS="$SONAR_PARAMS -Dsonar.scm.disabled=true"
+        
+        echo "Scanner config: project=$PROJECT_KEY, host=$SONAR_HOST_URL, branch=$SOURCE_BRANCH_CLEAN"
+        
+        SCANNER_OUTPUT=$(/opt/sonar-scanner/bin/sonar-scanner $SONAR_PARAMS 2>&1) && SCAN_STATUS="PASSED" || SCAN_STATUS="FAILED"
+        echo "$SCANNER_OUTPUT" | tail -50
+        
+        if echo "$SCANNER_OUTPUT" | grep -q "QUALITY GATE STATUS: PASSED"; then
+          SCANNER_QG_STATUS="OK"
+        elif echo "$SCANNER_OUTPUT" | grep -q "QUALITY GATE STATUS: FAILED"; then
+          SCANNER_QG_STATUS="ERROR"
+        fi
+        
+        echo "$SCAN_STATUS" > /tmp/scan_status
+        echo "$SCANNER_QG_STATUS" > /tmp/scanner_qg_status
+        
+        # Wait for analysis to complete
+        sleep 20
+        
+        # ================================================================
+        # FETCH RESULTS FROM SONARQUBE
+        # ================================================================
+        
+        SCANNER_QG_STATUS=$(cat /tmp/scanner_qg_status 2>/dev/null || echo "UNKNOWN")
+        
+        # Initialize
+        SONAR_QG_STATUS="UNKNOWN"
+        BUGS_TOTAL="0" BUGS_BLOCKER="0" BUGS_HIGH="0" BUGS_MEDIUM="0" BUGS_LOW="0"
+        VULN_TOTAL="0" VULN_BLOCKER="0" VULN_HIGH="0" VULN_MEDIUM="0" VULN_LOW="0"
+        SECRETS_TOTAL="0" SECRETS_BLOCKER="0" SECRETS_HIGH="0" SECRETS_MEDIUM="0" SECRETS_LOW="0"
+        SMELLS_TOTAL="0" SMELLS_BLOCKER="0" SMELLS_HIGH="0" SMELLS_MEDIUM="0" SMELLS_LOW="0"
+        HOTSPOTS_TOTAL="0"
+        
+        # Quality Gate
+        echo "Fetching Quality Gate status..."
+        QG_RESPONSE=$(curl -s -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/qualitygates/project_status?projectKey=${PROJECT_KEY}&branch=${SOURCE_BRANCH_CLEAN}")
+        API_QG_STATUS=$(echo "$QG_RESPONSE" | jq -r '.projectStatus.status // "UNKNOWN"')
+        
+        if [ "$SCANNER_QG_STATUS" != "UNKNOWN" ]; then
+          SONAR_QG_STATUS="$SCANNER_QG_STATUS"
+        elif [ "$API_QG_STATUS" != "NONE" ] && [ "$API_QG_STATUS" != "null" ] && [ -n "$API_QG_STATUS" ]; then
+          SONAR_QG_STATUS="$API_QG_STATUS"
+        fi
+        echo "Quality Gate: $SONAR_QG_STATUS"
+        
+        # Metrics
+        METRICS_RESPONSE=$(curl -s -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/measures/component?component=${PROJECT_KEY}&branch=${SOURCE_BRANCH_CLEAN}&metricKeys=bugs,vulnerabilities,code_smells,security_hotspots,coverage,duplicated_lines_density")
+        SONAR_COVERAGE=$(echo "$METRICS_RESPONSE" | jq -r '.component.measures[]? | select(.metric=="coverage") | .value // "N/A"')
+        SONAR_DUPLICATION=$(echo "$METRICS_RESPONSE" | jq -r '.component.measures[]? | select(.metric=="duplicated_lines_density") | .value // "N/A"')
+        [ -z "$SONAR_COVERAGE" ] && SONAR_COVERAGE="N/A"
+        [ -z "$SONAR_DUPLICATION" ] && SONAR_DUPLICATION="N/A"
+        
+        # Bugs
+        echo "Fetching Bugs..."
+        BUGS_RESPONSE=$(curl -s -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/issues/search?componentKeys=${PROJECT_KEY}&branch=${SOURCE_BRANCH_CLEAN}&types=BUG&facets=severities&ps=1")
+        echo "$BUGS_RESPONSE" > /tmp/evidence/bugs-report.json
+        BUGS_TOTAL=$(echo "$BUGS_RESPONSE" | jq -r '.total // 0')
+        BUGS_BLOCKER=$(echo "$BUGS_RESPONSE" | jq -r '[.facets[]?|select(.property=="severities")|.values[]?|select(.val=="BLOCKER")|.count]|add // 0')
+        BUGS_HIGH=$(echo "$BUGS_RESPONSE" | jq -r '[.facets[]?|select(.property=="severities")|.values[]?|select(.val=="CRITICAL")|.count]|add // 0')
+        BUGS_MEDIUM=$(echo "$BUGS_RESPONSE" | jq -r '[.facets[]?|select(.property=="severities")|.values[]?|select(.val=="MAJOR")|.count]|add // 0')
+        BUGS_LOW=$(echo "$BUGS_RESPONSE" | jq -r '[.facets[]?|select(.property=="severities")|.values[]?|select(.val=="MINOR" or .val=="INFO")|.count]|add // 0')
+        
+        # All Vulnerabilities
+        echo "Fetching Vulnerabilities..."
+        ALL_VULN_RESPONSE=$(curl -s -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/issues/search?componentKeys=${PROJECT_KEY}&branch=${SOURCE_BRANCH_CLEAN}&types=VULNERABILITY&facets=severities&ps=1")
+        echo "$ALL_VULN_RESPONSE" > /tmp/evidence/all-vulnerabilities.json
+        ALL_VULN_TOTAL=$(echo "$ALL_VULN_RESPONSE" | jq -r '.total // 0')
+        ALL_VULN_BLOCKER=$(echo "$ALL_VULN_RESPONSE" | jq -r '[.facets[]?|select(.property=="severities")|.values[]?|select(.val=="BLOCKER")|.count]|add // 0')
+        ALL_VULN_HIGH=$(echo "$ALL_VULN_RESPONSE" | jq -r '[.facets[]?|select(.property=="severities")|.values[]?|select(.val=="CRITICAL")|.count]|add // 0')
+        ALL_VULN_MEDIUM=$(echo "$ALL_VULN_RESPONSE" | jq -r '[.facets[]?|select(.property=="severities")|.values[]?|select(.val=="MAJOR")|.count]|add // 0')
+        ALL_VULN_LOW=$(echo "$ALL_VULN_RESPONSE" | jq -r '[.facets[]?|select(.property=="severities")|.values[]?|select(.val=="MINOR" or .val=="INFO")|.count]|add // 0')
+        
+        # Secrets
+        echo "Fetching Secrets..."
+        SECRETS_RESPONSE=$(curl -s -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/issues/search?componentKeys=${PROJECT_KEY}&branch=${SOURCE_BRANCH_CLEAN}&types=VULNERABILITY&tags=secret&facets=severities&ps=1")
+        echo "$SECRETS_RESPONSE" > /tmp/evidence/secrets-report.json
+        SECRETS_TOTAL=$(echo "$SECRETS_RESPONSE" | jq -r '.total // 0')
+        SECRETS_BLOCKER=$(echo "$SECRETS_RESPONSE" | jq -r '[.facets[]?|select(.property=="severities")|.values[]?|select(.val=="BLOCKER")|.count]|add // 0')
+        SECRETS_HIGH=$(echo "$SECRETS_RESPONSE" | jq -r '[.facets[]?|select(.property=="severities")|.values[]?|select(.val=="CRITICAL")|.count]|add // 0')
+        SECRETS_MEDIUM=$(echo "$SECRETS_RESPONSE" | jq -r '[.facets[]?|select(.property=="severities")|.values[]?|select(.val=="MAJOR")|.count]|add // 0')
+        SECRETS_LOW=$(echo "$SECRETS_RESPONSE" | jq -r '[.facets[]?|select(.property=="severities")|.values[]?|select(.val=="MINOR" or .val=="INFO")|.count]|add // 0')
+        
+        # Fallback: try with rule pattern
+        if [ "$SECRETS_TOTAL" = "0" ] || [ -z "$SECRETS_TOTAL" ]; then
+          SECRETS_RESPONSE2=$(curl -s -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/issues/search?componentKeys=${PROJECT_KEY}&branch=${SOURCE_BRANCH_CLEAN}&types=VULNERABILITY&rules=secrets:*&facets=severities&ps=1" 2>/dev/null)
+          SECRETS_TOTAL2=$(echo "$SECRETS_RESPONSE2" | jq -r '.total // 0')
+          if [ "$SECRETS_TOTAL2" -gt 0 ] 2>/dev/null; then
+            SECRETS_TOTAL="$SECRETS_TOTAL2"
+            SECRETS_BLOCKER=$(echo "$SECRETS_RESPONSE2" | jq -r '[.facets[]?|select(.property=="severities")|.values[]?|select(.val=="BLOCKER")|.count]|add // 0')
+            SECRETS_HIGH=$(echo "$SECRETS_RESPONSE2" | jq -r '[.facets[]?|select(.property=="severities")|.values[]?|select(.val=="CRITICAL")|.count]|add // 0')
+            SECRETS_MEDIUM=$(echo "$SECRETS_RESPONSE2" | jq -r '[.facets[]?|select(.property=="severities")|.values[]?|select(.val=="MAJOR")|.count]|add // 0')
+            SECRETS_LOW=$(echo "$SECRETS_RESPONSE2" | jq -r '[.facets[]?|select(.property=="severities")|.values[]?|select(.val=="MINOR" or .val=="INFO")|.count]|add // 0')
+            echo "$SECRETS_RESPONSE2" > /tmp/evidence/secrets-report.json
+          fi
+        fi
+        
+        # Code Vulnerabilities (All - Secrets)
+        VULN_TOTAL=$((ALL_VULN_TOTAL - SECRETS_TOTAL))
+        VULN_BLOCKER=$((ALL_VULN_BLOCKER - SECRETS_BLOCKER))
+        VULN_HIGH=$((ALL_VULN_HIGH - SECRETS_HIGH))
+        VULN_MEDIUM=$((ALL_VULN_MEDIUM - SECRETS_MEDIUM))
+        VULN_LOW=$((ALL_VULN_LOW - SECRETS_LOW))
+        [ "$VULN_TOTAL" -lt 0 ] 2>/dev/null && VULN_TOTAL="0"
+        [ "$VULN_BLOCKER" -lt 0 ] 2>/dev/null && VULN_BLOCKER="0"
+        [ "$VULN_HIGH" -lt 0 ] 2>/dev/null && VULN_HIGH="0"
+        [ "$VULN_MEDIUM" -lt 0 ] 2>/dev/null && VULN_MEDIUM="0"
+        [ "$VULN_LOW" -lt 0 ] 2>/dev/null && VULN_LOW="0"
+        
+        # Code Smells
+        echo "Fetching Code Smells..."
+        SMELLS_RESPONSE=$(curl -s -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/issues/search?componentKeys=${PROJECT_KEY}&branch=${SOURCE_BRANCH_CLEAN}&types=CODE_SMELL&facets=severities&ps=1")
+        echo "$SMELLS_RESPONSE" > /tmp/evidence/code-smells-report.json
+        SMELLS_TOTAL=$(echo "$SMELLS_RESPONSE" | jq -r '.total // 0')
+        SMELLS_BLOCKER=$(echo "$SMELLS_RESPONSE" | jq -r '[.facets[]?|select(.property=="severities")|.values[]?|select(.val=="BLOCKER")|.count]|add // 0')
+        SMELLS_HIGH=$(echo "$SMELLS_RESPONSE" | jq -r '[.facets[]?|select(.property=="severities")|.values[]?|select(.val=="CRITICAL")|.count]|add // 0')
+        SMELLS_MEDIUM=$(echo "$SMELLS_RESPONSE" | jq -r '[.facets[]?|select(.property=="severities")|.values[]?|select(.val=="MAJOR")|.count]|add // 0')
+        SMELLS_LOW=$(echo "$SMELLS_RESPONSE" | jq -r '[.facets[]?|select(.property=="severities")|.values[]?|select(.val=="MINOR" or .val=="INFO")|.count]|add // 0')
+        
+        # Security Hotspots
+        echo "Fetching Security Hotspots..."
+        HOTSPOTS_RESPONSE=$(curl -s -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/hotspots/search?projectKey=${PROJECT_KEY}&branch=${SOURCE_BRANCH_CLEAN}&ps=1")
+        HOTSPOTS_TOTAL=$(echo "$HOTSPOTS_RESPONSE" | jq -r '.paging.total // 0')
+        [ -z "$HOTSPOTS_TOTAL" ] && HOTSPOTS_TOTAL="0"
+        echo "$HOTSPOTS_RESPONSE" > /tmp/evidence/hotspots-report.json
+        
+        # Fetch dependency count from SonarQube (Advanced Security)
+        echo "Fetching Dependencies (SonarQube Advanced Security)..."
+        DEPS_RESPONSE=$(curl -s -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/measures/component?component=${PROJECT_KEY}&branch=${SOURCE_BRANCH_CLEAN}&metricKeys=dependencies" 2>/dev/null)
+        DEPS_COUNT=$(echo "$DEPS_RESPONSE" | jq -r '.component.measures[]? | select(.metric=="dependencies") | .value // "0"' 2>/dev/null)
+        [ -z "$DEPS_COUNT" ] && DEPS_COUNT="0"
+        
+        # Print Summary
+        echo ""
+        echo "=========================================="
+        echo "SCAN RESULTS SUMMARY"
+        echo "=========================================="
+        echo "Quality Gate: $SONAR_QG_STATUS"
+        echo ""
+        echo "BUGS: Total=$BUGS_TOTAL | Blocker=$BUGS_BLOCKER | Critical=$BUGS_HIGH | Major=$BUGS_MEDIUM | Minor=$BUGS_LOW"
+        echo "VULNERABILITIES: Total=$VULN_TOTAL | Blocker=$VULN_BLOCKER | Critical=$VULN_HIGH | Major=$VULN_MEDIUM | Minor=$VULN_LOW"
+        echo "SECRETS: Total=$SECRETS_TOTAL | Blocker=$SECRETS_BLOCKER | Critical=$SECRETS_HIGH | Major=$SECRETS_MEDIUM | Minor=$SECRETS_LOW"
+        echo "CODE SMELLS: Total=$SMELLS_TOTAL | Blocker=$SMELLS_BLOCKER | Critical=$SMELLS_HIGH | Major=$SMELLS_MEDIUM | Minor=$SMELLS_LOW"
+        echo "SECURITY HOTSPOTS: $HOTSPOTS_TOTAL"
+        echo "DEPENDENCIES: $DEPS_COUNT (via SonarQube Advanced Security)"
+        echo "=========================================="
+        
+        # Save results
+        echo "$SONAR_QG_STATUS" > /tmp/sonar_qg_status
+        echo "$BUGS_TOTAL" > /tmp/bugs_total; echo "$BUGS_BLOCKER" > /tmp/bugs_blocker; echo "$BUGS_HIGH" > /tmp/bugs_high; echo "$BUGS_MEDIUM" > /tmp/bugs_medium; echo "$BUGS_LOW" > /tmp/bugs_low
+        echo "$VULN_TOTAL" > /tmp/vuln_total; echo "$VULN_BLOCKER" > /tmp/vuln_blocker; echo "$VULN_HIGH" > /tmp/vuln_high; echo "$VULN_MEDIUM" > /tmp/vuln_medium; echo "$VULN_LOW" > /tmp/vuln_low
+        echo "$SECRETS_TOTAL" > /tmp/secrets_total; echo "$SECRETS_BLOCKER" > /tmp/secrets_blocker; echo "$SECRETS_HIGH" > /tmp/secrets_high; echo "$SECRETS_MEDIUM" > /tmp/secrets_medium; echo "$SECRETS_LOW" > /tmp/secrets_low
+        echo "$SMELLS_TOTAL" > /tmp/smells_total; echo "$SMELLS_BLOCKER" > /tmp/smells_blocker; echo "$SMELLS_HIGH" > /tmp/smells_high; echo "$SMELLS_MEDIUM" > /tmp/smells_medium; echo "$SMELLS_LOW" > /tmp/smells_low
+        echo "$HOTSPOTS_TOTAL" > /tmp/hotspots_total
+        echo "$DEPS_COUNT" > /tmp/deps_count
+        echo "$SONAR_COVERAGE" > /tmp/sonar_coverage
+        echo "$SONAR_DUPLICATION" > /tmp/sonar_duplication
+
+  post_build:
+    commands:
+      - echo "=== Post-Build - Generate PR Comment ==="
+      - |
+        [ -f /tmp/scan_status ] && [ "$(cat /tmp/scan_status)" = "SKIP" ] && exit 0
+        
+        # Load configuration
+        APP_ID=$(cat /tmp/app_id 2>/dev/null || echo "$REPO_NAME")
+        APP_NAME=$(cat /tmp/app_name 2>/dev/null || echo "")
+        BU=$(cat /tmp/bu 2>/dev/null || echo "")
+        SBU=$(cat /tmp/sbu 2>/dev/null || echo "")
+        CORRELATION_ID=$(cat /tmp/correlation_id 2>/dev/null || echo "UNKNOWN")
+        PROJECT_KEY=$(cat /tmp/project_key 2>/dev/null)
+        QUALITY_GATE_NAME=$(cat /tmp/qg_name 2>/dev/null || echo "(default)")
+        TECHNICAL_ERROR=$(cat /tmp/technical_error 2>/dev/null || echo "false")
+        ERROR_MESSAGE=$(cat /tmp/error_message 2>/dev/null || echo "")
+        SOURCE_BRANCH_CLEAN=$(cat /tmp/source_branch_clean 2>/dev/null || echo "main")
+        DEST_BRANCH_CLEAN=$(echo "$DEST_BRANCH" | sed 's|refs/heads/||')
+        DETECTED_LANGUAGE=$(cat /tmp/app_type 2>/dev/null || echo "generic")
+        
+        # Load scan results
+        SCAN_STATUS=$(cat /tmp/scan_status 2>/dev/null || echo "UNKNOWN")
+        SONAR_QG_STATUS=$(cat /tmp/sonar_qg_status 2>/dev/null || echo "UNKNOWN")
+        DEPS_COUNT=$(cat /tmp/deps_count 2>/dev/null || echo "0")
+        
+        BUGS_TOTAL=$(cat /tmp/bugs_total 2>/dev/null || echo "0")
+        BUGS_BLOCKER=$(cat /tmp/bugs_blocker 2>/dev/null || echo "0")
+        BUGS_HIGH=$(cat /tmp/bugs_high 2>/dev/null || echo "0")
+        BUGS_MEDIUM=$(cat /tmp/bugs_medium 2>/dev/null || echo "0")
+        BUGS_LOW=$(cat /tmp/bugs_low 2>/dev/null || echo "0")
+        
+        VULN_TOTAL=$(cat /tmp/vuln_total 2>/dev/null || echo "0")
+        VULN_BLOCKER=$(cat /tmp/vuln_blocker 2>/dev/null || echo "0")
+        VULN_HIGH=$(cat /tmp/vuln_high 2>/dev/null || echo "0")
+        VULN_MEDIUM=$(cat /tmp/vuln_medium 2>/dev/null || echo "0")
+        VULN_LOW=$(cat /tmp/vuln_low 2>/dev/null || echo "0")
+        
+        SECRETS_TOTAL=$(cat /tmp/secrets_total 2>/dev/null || echo "0")
+        SECRETS_BLOCKER=$(cat /tmp/secrets_blocker 2>/dev/null || echo "0")
+        SECRETS_HIGH=$(cat /tmp/secrets_high 2>/dev/null || echo "0")
+        SECRETS_MEDIUM=$(cat /tmp/secrets_medium 2>/dev/null || echo "0")
+        SECRETS_LOW=$(cat /tmp/secrets_low 2>/dev/null || echo "0")
+        
+        SMELLS_TOTAL=$(cat /tmp/smells_total 2>/dev/null || echo "0")
+        SMELLS_BLOCKER=$(cat /tmp/smells_blocker 2>/dev/null || echo "0")
+        SMELLS_HIGH=$(cat /tmp/smells_high 2>/dev/null || echo "0")
+        SMELLS_MEDIUM=$(cat /tmp/smells_medium 2>/dev/null || echo "0")
+        SMELLS_LOW=$(cat /tmp/smells_low 2>/dev/null || echo "0")
+        
+        HOTSPOTS_TOTAL=$(cat /tmp/hotspots_total 2>/dev/null || echo "0")
+        
+        # Calculate duration
+        SCAN_END_TIME=$(date +%s)
+        DURATION=$((SCAN_END_TIME - SCAN_START_TIME))
+        DURATION_MIN=$((DURATION / 60))
+        DURATION_SEC=$((DURATION % 60))
+        
+        # Determine overall status (based on SonarQube Quality Gate)
+        if [ "$TECHNICAL_ERROR" = "true" ]; then 
+          OVERALL_STATUS="ERROR"
+          MERGE_RECOMMENDATION="SCAN_ERROR"
+        elif [ "$SONAR_QG_STATUS" = "ERROR" ]; then 
+          OVERALL_STATUS="FAILED"
+          MERGE_RECOMMENDATION="DO_NOT_MERGE"
+        elif [ "$SONAR_QG_STATUS" = "OK" ]; then 
+          OVERALL_STATUS="PASSED"
+          MERGE_RECOMMENDATION="SAFE_TO_MERGE"
+        else 
+          OVERALL_STATUS="WARNING"
+          MERGE_RECOMMENDATION="REVIEW_RECOMMENDED"
+        fi
+        
+        TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+        COMMIT_SHORT=$(echo "$SOURCE_COMMIT" | cut -c1-8)
+        
+        case "$OVERALL_STATUS" in 
+          PASSED) STATUS_EMOJI="✅";; 
+          WARNING) STATUS_EMOJI="⚠️";; 
+          FAILED) STATUS_EMOJI="❌";; 
+          *) STATUS_EMOJI="🔴";; 
+        esac
+        
+        # ================================================================
+        # GENERATE PR COMMENT
+        # ================================================================
+        
+        echo "## 🔐 DevSecOps Security Scan Report" > /tmp/pr_comment.md
+        echo "" >> /tmp/pr_comment.md
+        echo "### $STATUS_EMOJI Overall Status: **$OVERALL_STATUS**" >> /tmp/pr_comment.md
+        echo "" >> /tmp/pr_comment.md
+        
+        case "$MERGE_RECOMMENDATION" in
+          SAFE_TO_MERGE) echo "> ✅ **SAFE TO MERGE** - Quality Gate passed." >> /tmp/pr_comment.md;;
+          REVIEW_RECOMMENDED) echo "> ⚠️ **REVIEW RECOMMENDED** - Quality Gate status unknown." >> /tmp/pr_comment.md;;
+          DO_NOT_MERGE) echo "> ❌ **DO NOT MERGE** - Quality Gate failed." >> /tmp/pr_comment.md;;
+          SCAN_ERROR) echo "> 🔴 **SCAN ERROR** - $ERROR_MESSAGE" >> /tmp/pr_comment.md;;
+        esac
+        
+        echo "" >> /tmp/pr_comment.md
+        echo "---" >> /tmp/pr_comment.md
+        echo "" >> /tmp/pr_comment.md
+        
+        # Scan Context
+        echo "### 📋 Scan Context" >> /tmp/pr_comment.md
+        echo "" >> /tmp/pr_comment.md
+        echo "| Property | Value |" >> /tmp/pr_comment.md
+        echo "|----------|-------|" >> /tmp/pr_comment.md
+        [ -n "$APP_NAME" ] && [ "$APP_NAME" != "null" ] && echo "| Application | **$APP_NAME** (\`$APP_ID\`) |" >> /tmp/pr_comment.md || echo "| Application | \`$APP_ID\` |" >> /tmp/pr_comment.md
+        echo "| PR | #$PR_ID (\`$SOURCE_BRANCH_CLEAN\` → \`$DEST_BRANCH_CLEAN\`) |" >> /tmp/pr_comment.md
+        [ -n "$BU" ] && [ "$BU" != "null" ] && [ -n "$SBU" ] && [ "$SBU" != "null" ] && echo "| Business Unit | $BU / $SBU |" >> /tmp/pr_comment.md
+        echo "| Commit | \`$COMMIT_SHORT\` |" >> /tmp/pr_comment.md
+        echo "| Language | $DETECTED_LANGUAGE |" >> /tmp/pr_comment.md
+        echo "| Quality Gate | $QUALITY_GATE_NAME |" >> /tmp/pr_comment.md
+        echo "| Duration | ${DURATION_MIN}m ${DURATION_SEC}s |" >> /tmp/pr_comment.md
+        echo "" >> /tmp/pr_comment.md
+        echo "---" >> /tmp/pr_comment.md
+        echo "" >> /tmp/pr_comment.md
+        
+        # Security Summary
+        echo "### 🛡️ Security Summary" >> /tmp/pr_comment.md
+        echo "" >> /tmp/pr_comment.md
+        echo "| Category | Status | Total | Blocker | Critical | Major | Minor |" >> /tmp/pr_comment.md
+        echo "|----------|--------|-------|---------|----------|-------|-------|" >> /tmp/pr_comment.md
+        
+        [ "$BUGS_TOTAL" -gt 0 ] 2>/dev/null && BUGS_STATUS="⚠️" || BUGS_STATUS="✅"
+        echo "| 🐛 Bugs | $BUGS_STATUS | $BUGS_TOTAL | $BUGS_BLOCKER | $BUGS_HIGH | $BUGS_MEDIUM | $BUGS_LOW |" >> /tmp/pr_comment.md
+        
+        [ "$VULN_BLOCKER" -gt 0 ] 2>/dev/null && VULN_STATUS="❌" || { [ "$VULN_HIGH" -gt 0 ] 2>/dev/null && VULN_STATUS="❌" || { [ "$VULN_TOTAL" -gt 0 ] 2>/dev/null && VULN_STATUS="⚠️" || VULN_STATUS="✅"; }; }
+        echo "| 🔓 Vulnerabilities | $VULN_STATUS | $VULN_TOTAL | $VULN_BLOCKER | $VULN_HIGH | $VULN_MEDIUM | $VULN_LOW |" >> /tmp/pr_comment.md
+        
+        [ "$SECRETS_TOTAL" -gt 0 ] 2>/dev/null && SECRETS_STATUS="❌" || SECRETS_STATUS="✅"
+        echo "| 🔑 Secrets | $SECRETS_STATUS | $SECRETS_TOTAL | $SECRETS_BLOCKER | $SECRETS_HIGH | $SECRETS_MEDIUM | $SECRETS_LOW |" >> /tmp/pr_comment.md
+        
+        [ "$SMELLS_BLOCKER" -gt 0 ] 2>/dev/null && SMELLS_STATUS="⚠️" || { [ "$SMELLS_HIGH" -gt 0 ] 2>/dev/null && SMELLS_STATUS="⚠️" || SMELLS_STATUS="✅"; }
+        echo "| 🧹 Code Smells | $SMELLS_STATUS | $SMELLS_TOTAL | $SMELLS_BLOCKER | $SMELLS_HIGH | $SMELLS_MEDIUM | $SMELLS_LOW |" >> /tmp/pr_comment.md
+        
+        [ "$HOTSPOTS_TOTAL" -gt 0 ] 2>/dev/null && HOTSPOTS_STATUS="⚠️" || HOTSPOTS_STATUS="✅"
+        echo "| 🔥 Security Hotspots | $HOTSPOTS_STATUS | $HOTSPOTS_TOTAL | - | - | - | - |" >> /tmp/pr_comment.md
+        
+        echo "" >> /tmp/pr_comment.md
+        echo "---" >> /tmp/pr_comment.md
+        echo "" >> /tmp/pr_comment.md
+        
+        # Quality Gate Result
+        echo "### 📊 Quality Gate" >> /tmp/pr_comment.md
+        echo "" >> /tmp/pr_comment.md
+        [ "$SONAR_QG_STATUS" = "OK" ] && QG_EMOJI="✅" || { [ "$SONAR_QG_STATUS" = "ERROR" ] && QG_EMOJI="❌" || QG_EMOJI="⚠️"; }
+        echo "| Gate | Status |" >> /tmp/pr_comment.md
+        echo "|------|--------|" >> /tmp/pr_comment.md
+        echo "| $QUALITY_GATE_NAME | $QG_EMOJI **$SONAR_QG_STATUS** |" >> /tmp/pr_comment.md
+        echo "" >> /tmp/pr_comment.md
+        echo "---" >> /tmp/pr_comment.md
+        echo "" >> /tmp/pr_comment.md
+        
+        # Dependencies (from SonarQube)
+        echo "### 📦 Dependencies (SonarQube SCA)" >> /tmp/pr_comment.md
+        echo "" >> /tmp/pr_comment.md
+        echo "| Property | Value |" >> /tmp/pr_comment.md
+        echo "|----------|-------|" >> /tmp/pr_comment.md
+        echo "| Dependencies | $DEPS_COUNT |" >> /tmp/pr_comment.md
+        echo "| SBOM | Available in SonarQube UI |" >> /tmp/pr_comment.md
+        echo "" >> /tmp/pr_comment.md
+        echo "---" >> /tmp/pr_comment.md
+        echo "" >> /tmp/pr_comment.md
+        
+        # Quick Links
+        echo "### 🔗 Quick Links" >> /tmp/pr_comment.md
+        echo "" >> /tmp/pr_comment.md
+        echo "| Link | Description |" >> /tmp/pr_comment.md
+        echo "|------|-------------|" >> /tmp/pr_comment.md
+        echo "| [📊 Dashboard](${SONAR_HOST_URL}/dashboard?id=${PROJECT_KEY}&branch=${SOURCE_BRANCH_CLEAN}) | Full analysis overview |" >> /tmp/pr_comment.md
+        echo "| [🔓 Issues](${SONAR_HOST_URL}/project/issues?id=${PROJECT_KEY}&branch=${SOURCE_BRANCH_CLEAN}&types=VULNERABILITY) | Code vulnerabilities |" >> /tmp/pr_comment.md
+        echo "| [🔑 Secrets](${SONAR_HOST_URL}/project/issues?id=${PROJECT_KEY}&branch=${SOURCE_BRANCH_CLEAN}&types=VULNERABILITY&tags=secret) | Detected secrets |" >> /tmp/pr_comment.md
+        echo "| [🔥 Hotspots](${SONAR_HOST_URL}/security_hotspots?id=${PROJECT_KEY}&branch=${SOURCE_BRANCH_CLEAN}) | Security hotspots |" >> /tmp/pr_comment.md
+        echo "| [📦 Dependencies](${SONAR_HOST_URL}/project/dependencies?id=${PROJECT_KEY}&branch=${SOURCE_BRANCH_CLEAN}) | Dependency analysis & SBOM |" >> /tmp/pr_comment.md
+        echo "" >> /tmp/pr_comment.md
+        echo "---" >> /tmp/pr_comment.md
+        echo "🤖 **DevSecOps v3.3** | \`$CORRELATION_ID\` | $TIMESTAMP" >> /tmp/pr_comment.md
+        
+        # Post comment to CodeCommit (using saved credentials)
+        export AWS_ACCESS_KEY_ID="$APP_AWS_ACCESS_KEY_ID"
+        export AWS_SECRET_ACCESS_KEY="$APP_AWS_SECRET_ACCESS_KEY"
+        export AWS_SESSION_TOKEN="$APP_AWS_SESSION_TOKEN"
+        COMMENT_CONTENT=$(cat /tmp/pr_comment.md)
+        aws codecommit post-comment-for-pull-request --pull-request-id "$PR_ID" --repository-name "$REPO_NAME" \
+          --before-commit-id "$DEST_COMMIT" --after-commit-id "$SOURCE_COMMIT" --content "$COMMENT_CONTENT" --region "$SOURCE_REGION" 2>/dev/null || \
+          aws codecommit post-comment-for-compared-commit --repository-name "$REPO_NAME" --after-commit-id "$SOURCE_COMMIT" \
+            --content "$COMMENT_CONTENT" --region "$SOURCE_REGION" 2>/dev/null || true
+        unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+        
+        # Upload evidence to S3
+        if [ -n "$EVIDENCE_BUCKET" ]; then
+          S3_PATH="s3://${EVIDENCE_BUCKET}/${SOURCE_ACCOUNT_ID}/${APP_ID}/pr-${PR_ID}"
+          SONAR_HOST_URL=$(cat /tmp/sonar_host_url)
+          
+          # Generate single comprehensive pr-scan-report.json (merged insights + pr-comment)
+          jq -n \
+            --arg schemaVersion "3.3" \
+            --arg correlationId "$CORRELATION_ID" \
+            --arg appId "$APP_ID" \
+            --arg appName "$APP_NAME" \
+            --arg bu "$BU" \
+            --arg sbu "$SBU" \
+            --arg repository "$REPO_NAME" \
+            --arg prId "$PR_ID" \
+            --arg sourceBranch "$SOURCE_BRANCH_CLEAN" \
+            --arg destBranch "$DEST_BRANCH_CLEAN" \
+            --arg commit "$SOURCE_COMMIT" \
+            --arg commitShort "$COMMIT_SHORT" \
+            --arg language "$DETECTED_LANGUAGE" \
+            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg duration "${DURATION_MIN}m ${DURATION_SEC}s" \
+            --arg sonarProject "$PROJECT_KEY" \
+            --arg qualityGate "$QUALITY_GATE_NAME" \
+            --arg overallStatus "$OVERALL_STATUS" \
+            --arg mergeRecommendation "$MERGE_RECOMMENDATION" \
+            --arg qualityGateStatus "$SONAR_QG_STATUS" \
+            --argjson bugsTotal "${BUGS_TOTAL:-0}" \
+            --argjson bugsBlocker "${BUGS_BLOCKER:-0}" \
+            --argjson bugsCritical "${BUGS_HIGH:-0}" \
+            --argjson bugsMajor "${BUGS_MEDIUM:-0}" \
+            --argjson bugsMinor "${BUGS_LOW:-0}" \
+            --argjson vulnTotal "${VULN_TOTAL:-0}" \
+            --argjson vulnBlocker "${VULN_BLOCKER:-0}" \
+            --argjson vulnCritical "${VULN_HIGH:-0}" \
+            --argjson vulnMajor "${VULN_MEDIUM:-0}" \
+            --argjson vulnMinor "${VULN_LOW:-0}" \
+            --argjson secretsTotal "${SECRETS_TOTAL:-0}" \
+            --argjson secretsBlocker "${SECRETS_BLOCKER:-0}" \
+            --argjson secretsCritical "${SECRETS_HIGH:-0}" \
+            --argjson secretsMajor "${SECRETS_MEDIUM:-0}" \
+            --argjson secretsMinor "${SECRETS_LOW:-0}" \
+            --argjson smellsTotal "${SMELLS_TOTAL:-0}" \
+            --argjson smellsBlocker "${SMELLS_BLOCKER:-0}" \
+            --argjson smellsCritical "${SMELLS_HIGH:-0}" \
+            --argjson smellsMajor "${SMELLS_MEDIUM:-0}" \
+            --argjson smellsMinor "${SMELLS_LOW:-0}" \
+            --argjson hotspotsTotal "${HOTSPOTS_TOTAL:-0}" \
+            --argjson depsCount "${DEPS_COUNT:-0}" \
+            --arg sonarHostUrl "$SONAR_HOST_URL" \
+            '{
+              schemaVersion: $schemaVersion,
+              metadata: {
+                correlationId: $correlationId,
+                appId: $appId,
+                appName: $appName,
+                bu: $bu,
+                sbu: $sbu,
+                repository: $repository,
+                prId: $prId,
+                sourceBranch: $sourceBranch,
+                destBranch: $destBranch,
+                commit: $commit,
+                commitShort: $commitShort,
+                language: $language,
+                timestamp: $timestamp,
+                duration: $duration,
+                sonarProject: $sonarProject,
+                qualityGate: $qualityGate
+              },
+              result: {
+                overallStatus: $overallStatus,
+                mergeRecommendation: $mergeRecommendation,
+                qualityGateStatus: $qualityGateStatus
+              },
+              findings: {
+                bugs: {total: $bugsTotal, blocker: $bugsBlocker, critical: $bugsCritical, major: $bugsMajor, minor: $bugsMinor},
+                vulnerabilities: {total: $vulnTotal, blocker: $vulnBlocker, critical: $vulnCritical, major: $vulnMajor, minor: $vulnMinor},
+                secrets: {total: $secretsTotal, blocker: $secretsBlocker, critical: $secretsCritical, major: $secretsMajor, minor: $secretsMinor},
+                codeSmells: {total: $smellsTotal, blocker: $smellsBlocker, critical: $smellsCritical, major: $smellsMajor, minor: $smellsMinor},
+                securityHotspots: {total: $hotspotsTotal},
+                dependencies: {count: $depsCount, sbom: "Available in SonarQube UI"}
+              },
+              links: {
+                dashboard: "\($sonarHostUrl)/dashboard?id=\($sonarProject)&branch=\($sourceBranch)",
+                issues: "\($sonarHostUrl)/project/issues?id=\($sonarProject)&branch=\($sourceBranch)&types=VULNERABILITY",
+                secrets: "\($sonarHostUrl)/project/issues?id=\($sonarProject)&branch=\($sourceBranch)&types=VULNERABILITY&tags=secret",
+                hotspots: "\($sonarHostUrl)/security_hotspots?id=\($sonarProject)&branch=\($sourceBranch)",
+                dependencies: "\($sonarHostUrl)/project/dependencies?id=\($sonarProject)&branch=\($sourceBranch)"
+              }
+            }' > /tmp/evidence/pr-scan-report.json
+          
+          # Upload pr-scan-report.json (merged insights + pr-comment)
+          aws s3 cp /tmp/evidence/pr-scan-report.json "${S3_PATH}/pr-scan-report.json" 2>/dev/null
+          
+          # Upload raw SonarQube API response files (for detailed analysis)
+          [ -f "/tmp/evidence/bugs-report.json" ] && aws s3 cp /tmp/evidence/bugs-report.json "${S3_PATH}/sast/bugs-report.json" 2>/dev/null
+          [ -f "/tmp/evidence/all-vulnerabilities.json" ] && aws s3 cp /tmp/evidence/all-vulnerabilities.json "${S3_PATH}/sast/vulnerabilities-report.json" 2>/dev/null
+          [ -f "/tmp/evidence/secrets-report.json" ] && aws s3 cp /tmp/evidence/secrets-report.json "${S3_PATH}/secrets/secrets-report.json" 2>/dev/null
+          [ -f "/tmp/evidence/code-smells-report.json" ] && aws s3 cp /tmp/evidence/code-smells-report.json "${S3_PATH}/sast/code-smells-report.json" 2>/dev/null
+          [ -f "/tmp/evidence/hotspots-report.json" ] && aws s3 cp /tmp/evidence/hotspots-report.json "${S3_PATH}/sast/hotspots-report.json" 2>/dev/null
+        fi
+        
+        # Emit EventBridge event
+        aws events put-events --entries "[{\"Source\":\"devsecops.pr-scan\",\"DetailType\":\"PR Scan Completed\",\"Detail\":\"{\\\"correlationId\\\":\\\"$CORRELATION_ID\\\",\\\"appId\\\":\\\"$APP_ID\\\",\\\"repository\\\":\\\"$REPO_NAME\\\",\\\"prId\\\":\\\"$PR_ID\\\",\\\"status\\\":\\\"$OVERALL_STATUS\\\",\\\"qualityGate\\\":\\\"$SONAR_QG_STATUS\\\"}\",\"EventBusName\":\"default\"}]" --region "${AWS_REGION:-ap-south-1}" 2>/dev/null || true
+        
+        # ================================================================
+        # AUTO-APPROVAL (v3.3) - Approve PR when Quality Gate passes
+        # ================================================================
+        # This feature requires:
+        # 1. EnableAutoApproval=true in app-account-resources.yaml
+        # 2. Approval Rule Template associated with the repository
+        # 3. ENABLE_AUTO_APPROVAL=true (default) in buildspec
+        # ================================================================
+        
+        if [ "${ENABLE_AUTO_APPROVAL:-true}" = "true" ]; then
+          echo ""
+          echo "=== Auto-Approval Check (v3.3) ==="
+          
+          if [ "$SONAR_QG_STATUS" = "OK" ]; then
+            echo "Quality Gate PASSED - Attempting to auto-approve PR..."
+            
+            # Assume role with fixed session name for approval
+            # Session name MUST match ApprovalPoolMembers in Approval Rule Template
+            ROLE_ARN="arn:aws:iam::${SOURCE_ACCOUNT_ID}:role/PR-Scan-CodeCommit-Access-Role"
+            APPROVAL_CREDS=$(aws sts assume-role \
+              --role-arn "$ROLE_ARN" \
+              --role-session-name "${APPROVAL_SESSION_NAME:-SecurityScanner}" \
+              --external-id "pr-scan-cross-account" \
+              --duration-seconds 900 \
+              --query 'Credentials' \
+              --output json 2>&1) || {
+              echo "[WARN] Failed to assume role for approval: $APPROVAL_CREDS"
+              echo "PR will need manual approval."
+            }
+            
+            if [ -n "$APPROVAL_CREDS" ] && echo "$APPROVAL_CREDS" | jq -e '.AccessKeyId' >/dev/null 2>&1; then
+              export AWS_ACCESS_KEY_ID=$(echo "$APPROVAL_CREDS" | jq -r '.AccessKeyId')
+              export AWS_SECRET_ACCESS_KEY=$(echo "$APPROVAL_CREDS" | jq -r '.SecretAccessKey')
+              export AWS_SESSION_TOKEN=$(echo "$APPROVAL_CREDS" | jq -r '.SessionToken')
+              
+              # Approve the PR
+              APPROVAL_RESULT=$(aws codecommit update-pull-request-approval-state \
+                --pull-request-id "$PR_ID" \
+                --revision-id "$SOURCE_COMMIT" \
+                --approval-state "APPROVE" \
+                --region "$SOURCE_REGION" 2>&1) && {
+                echo "✅ PR #${PR_ID} AUTO-APPROVED by SecurityScanner"
+                echo "   Quality Gate: PASSED"
+                echo "   Approved by: arn:aws:sts::${SOURCE_ACCOUNT_ID}:assumed-role/PR-Scan-CodeCommit-Access-Role/${APPROVAL_SESSION_NAME:-SecurityScanner}"
+              } || {
+                echo "⚠️ Auto-approval failed: $APPROVAL_RESULT"
+                echo "   Possible reasons:"
+                echo "   - Approval Rule Template not associated with repository"
+                echo "   - PR already approved or merged"
+                echo "   - Session name mismatch in ApprovalPoolMembers"
+                echo "   PR will need manual approval."
+              }
+              
+              unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+            fi
+          else
+            echo "Quality Gate: $SONAR_QG_STATUS"
+            echo "❌ Quality Gate NOT PASSED - PR will NOT be auto-approved"
+            echo "   Developer must fix issues before merge."
+            echo "   See SonarQube dashboard for details."
+          fi
+        else
+          echo "Auto-approval is disabled (ENABLE_AUTO_APPROVAL=false)"
+        fi
+        
+        echo ""
+        echo "=========================================="
+        echo "SCAN COMPLETE"
+        echo "Status: $OVERALL_STATUS"
+        echo "Quality Gate: $SONAR_QG_STATUS"
+        echo "Recommendation: $MERGE_RECOMMENDATION"
+        [ "${ENABLE_AUTO_APPROVAL:-true}" = "true" ] && [ "$SONAR_QG_STATUS" = "OK" ] && echo "Auto-Approval: APPROVED ✅" || echo "Auto-Approval: NOT APPROVED (QG=$SONAR_QG_STATUS)"
+        echo "=========================================="
+        exit 0

@@ -1,0 +1,21 @@
+{
+  "version": "3.2",
+  "description": "PR Security Scan - Onboarded Repositories. Add repository names as keys to enable scanning.",
+  "repositories": {
+    "super-app-be": {
+      "appName": "super-app-be Application",
+      "sonarProject": "super-app-be",
+      "lang": "nodejs",
+      "bu": "Technology",
+      "sbu": "Platform Engineering",
+      "qualityGate": "Sonar way"
+    },
+    "payment-api": {
+      "appName": "Payment Gateway API",
+      "sonarProject": "payment-api",
+      "lang": "java-gradle",
+      "bu": "Payments",
+      "sbu": "Digital Payments"
+    }
+  }
+}
