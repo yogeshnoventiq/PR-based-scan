@@ -1,7 +1,7 @@
 # DevSecOps - PR-Based Security Scanning
 ## Solution Design Document
 
-**Version:** 3.3  
+**Version:** 3.4  
 **Author:** Noventiq  
 **Date:** November 2026
 
@@ -60,6 +60,7 @@ The solution uses a **Lift & Shift** approach - security scanning is performed w
 
 | Version | Key Changes |
 |---------|-------------|
+| **3.4** | Configurable logging with `LOG_LEVEL` (ERROR/INFO/DEBUG) |
 | **3.3** | Auto-Approval when Quality Gate passes, Approval Rule Template |
 | **3.2** | Branch filtering in EventBridge, Language in metadata (`lang`) |
 | **3.1** | Removed CycloneDX (SonarQube Advanced Security handles SBOM) |
@@ -67,10 +68,12 @@ The solution uses a **Lift & Shift** approach - security scanning is performed w
 | 2.6 | Opt-in model with `.pr-scan.yml` |
 | 2.5 | Self-hosted SonarQube, per-environment thresholds |
 
-### 1.5 v3.3 Key Features
+### 1.5 v3.4 Key Features
 
 | Feature | Description |
 |---------|-------------|
+| **LOG_LEVEL** | Configurable logging: ERROR (minimal) | INFO | DEBUG (verbose) |
+| **Cleaner Logs** | Suppressed git progress, S3 progress, API response JSON |
 | **Auto-Approval** | PRs automatically approved when Quality Gate passes |
 | **Approval Rule Template** | Created in app account (associate with repos) |
 | **Branch Filtering** | EventBridge filters by allowed branches (cost optimization) |
@@ -312,6 +315,9 @@ The solution uses a **Lift & Shift** approach - security scanning is performed w
 | `EVIDENCE_BUCKET` | CloudFormation | S3 bucket name |
 | `ALLOWED_BRANCHES_PARAM` | CloudFormation | SSM parameter path |
 | `CENTRAL_ACCOUNT_ID` | CloudFormation | Central account ID |
+| `LOG_LEVEL` | Buildspec | Logging verbosity: `ERROR` (default), `INFO`, `DEBUG` |
+| `ENABLE_AUTO_APPROVAL` | Buildspec | Enable PR auto-approval: `true` (default), `false` |
+| `APPROVAL_SESSION_NAME` | Buildspec | Session name for approvals: `SecurityScanner` (default) |
 
 ### 4.4 Secrets Manager Structure
 
@@ -898,7 +904,7 @@ s3://pr-scan-evidence-{account}-{region}/{source-account}/{app-id}/pr-{pr-id}/
 
 ```json
 {
-  "schemaVersion": "3.3",
+  "schemaVersion": "3.4",
   "metadata": {
     "correlationId": "super-app-be-PR814-20261117T064701Z",
     "appId": "super-app-be",
@@ -1051,5 +1057,5 @@ Using `sonarProject` to share projects across accounts:
 ---
 
 **Author:** Noventiq  
-**Version:** 3.3  
+**Version:** 3.4  
 **Last Updated:** November 2026

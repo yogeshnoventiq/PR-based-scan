@@ -2,7 +2,7 @@
 ## Customer Demonstration Guide
 
 **Prepared by:** Noventiq  
-**Version:** 3.3  
+**Version:** 3.4  
 **Date:** November 2026
 
 ---
@@ -340,7 +340,7 @@ jq '.repositories["my-repo"]' onboarded-repos.json
 ---
 
 **Prepared by:** Noventiq  
-**Version:** 3.3
+**Version:** 3.4
 
 ---
 

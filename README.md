@@ -2,7 +2,7 @@
 
 > Automated security scanning for Pull Requests using self-hosted SonarQube Enterprise
 
-[![Version](https://img.shields.io/badge/Version-3.3-blue)]()
+[![Version](https://img.shields.io/badge/Version-3.4-blue)]()
 [![AWS](https://img.shields.io/badge/AWS-CodeBuild%20|%20EventBridge-orange)]()
 [![SonarQube](https://img.shields.io/badge/SonarQube-Enterprise-green)]()
 
@@ -19,6 +19,7 @@ Centralized security scanning for Pull Requests across multiple AWS accounts. Wh
 - **SBOM** - Software Bill of Materials (Enterprise Advanced Security)
 - **Security Hotspots** - Potential security issues requiring review
 - **Auto-Approval** - PRs automatically approved when Quality Gate passes (v3.3)
+- **Configurable Logging** - LOG_LEVEL control: ERROR (minimal) | INFO | DEBUG (v3.4)
 
 ---
 
@@ -299,7 +300,7 @@ The main output file contains:
 
 ```json
 {
-  "schemaVersion": "3.3",
+  "schemaVersion": "3.4",
   "metadata": {
     "correlationId": "app-id-PR123-20261117T064701Z",
     "appId": "my-application",
@@ -399,12 +400,60 @@ Only 4 domains needed:
 
 | Version | Changes |
 |---------|---------|
+| **3.4** | Configurable logging with `LOG_LEVEL` environment variable (ERROR/INFO/DEBUG), cleaner production logs |
 | **3.3** | Auto-Approval when Quality Gate passes, Approval Rule Template, `EnableAutoApproval` parameter |
 | **3.2** | Branch filtering in EventBridge (cost optimization), Language in metadata (`lang` field), merged output file |
 | **3.1** | Removed CycloneDX (SonarQube Advanced Security handles SBOM) |
 | **3.0** | Centralized metadata onboarding, dynamic Quality Gate, removed per-repo config |
 | 2.6 | Opt-in model with `.pr-scan.yml` |
 | 2.5 | Self-hosted SonarQube, per-environment thresholds |
+
+---
+
+## Logging Configuration (v3.4)
+
+The buildspec supports configurable logging via the `LOG_LEVEL` environment variable:
+
+| Level | Output |
+|-------|--------|
+| `ERROR` | Errors only (default - minimal output for production) |
+| `INFO` | Errors + informational messages |
+| `DEBUG` | Verbose output including all details (for troubleshooting) |
+
+### Setting LOG_LEVEL
+
+**Option 1: CodeBuild Environment Override (Recommended for troubleshooting)**
+
+In AWS Console → CodeBuild → Start build → Environment variables override:
+- Name: `LOG_LEVEL`
+- Value: `DEBUG`
+
+**Option 2: In buildspec environment variables (permanent change)**
+
+```yaml
+env:
+  variables:
+    LOG_LEVEL: "INFO"
+```
+
+### Log Functions
+
+The buildspec uses these logging functions:
+
+| Function | Shown When |
+|----------|------------|
+| `log_error` | Always (all levels) |
+| `log_warn` | Always (all levels) |
+| `log_info` | INFO or DEBUG |
+| `log_debug` | DEBUG only |
+
+### Production vs Troubleshooting
+
+| Use Case | Recommended LOG_LEVEL |
+|----------|----------------------|
+| Production (normal operation) | `ERROR` (default) |
+| Investigating issues | `DEBUG` |
+| Balanced visibility | `INFO` |
 
 ---
 
@@ -458,4 +507,4 @@ To disable, set `EnableAutoApproval=false` in CloudFormation or `ENABLE_AUTO_APP
 ---
 
 **Author:** Noventiq  
-**Version:** 3.3
+**Version:** 3.4

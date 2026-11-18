@@ -1,4 +1,4 @@
-# PR Scan Configuration Schema v3.3
+# PR Scan Configuration Schema v3.4
 
 This document describes the `onboarded-repos.json` configuration file schema for the DevSecOps PR Security Scanning solution.
 
@@ -341,7 +341,7 @@ The configuration values are included in `pr-scan-report.json`:
 
 ```json
 {
-  "schemaVersion": "3.3",
+  "schemaVersion": "3.4",
   "metadata": {
     "correlationId": "super-app-be-PR814-20261117T064701Z",
     "appId": "super-app-be",
@@ -506,6 +506,6 @@ jq -r '.repositories | keys[]' onboarded-repos.json
 
 ---
 
-**Version:** 3.3  
+**Version:** 3.4  
 **Author:** Noventiq  
 **Last Updated:** November 2026
