@@ -25,9 +25,9 @@ Centralized security scanning for Pull Requests across multiple AWS accounts. Wh
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                      APPLICATION ACCOUNT(S)                         │
-│                                                                     │
+┌────────────────────────────────────────────────────────────────────┐
+│                      APPLICATION ACCOUNT(S)                        │
+│                                                                    │
 │   ┌──────────────┐         ┌─────────────────┐                     │
 │   │  CodeCommit  │ ──PR──▶ │  EventBridge    │ ────────────┐       │
 │   │  Repository  │         │  Rule           │             │       │
@@ -35,9 +35,9 @@ Centralized security scanning for Pull Requests across multiple AWS accounts. Wh
 └────────────────────────────────────────────────────────────┼───────┘
                                                              │
                                                              ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                        CENTRAL ACCOUNT                              │
-│                                                                     │
+┌────────────────────────────────────────────────────────────────────┐
+│                        CENTRAL ACCOUNT                             │
+│                                                                    │
 │   ┌─────────────────┐    ┌──────────────┐    ┌──────────────────┐  │
 │   │  Event Bus      │───▶│  EventBridge │───▶│    CodeBuild     │  │
 │   │  (pr-scan)      │    │  Rule        │    │                  │  │
@@ -46,13 +46,13 @@ Centralized security scanning for Pull Requests across multiple AWS accounts. Wh
 │   ┌─────────────────────────────────────┐    │ 3. Run SonarQube │  │
 │   │  pr-scan-buildspecs (CodeCommit)    │    │ 4. Post comment  │  │
 │   │  ├── buildspec/pr-scan-buildspec.yaml│   │ 5. Upload to S3  │  │
-│   │  └── onboarded-repos.json  ◄────────────┘                  │  │
+│   │  └── onboarded-repos.json  ◄────────────┘                   │  │
 │   └─────────────────────────────────────┘    └──────────────────┘  │
-│                                                                     │
+│                                                                    │
 │   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐             │
 │   │ S3 Evidence  │  │ SSM Params   │  │ Secrets Mgr  │             │
 │   └──────────────┘  └──────────────┘  └──────────────┘             │
-└─────────────────────────────────────────────────────────────────────┘
+└────────────────────────────────────────────────────────────────────┘
                                 │
                                 ▼
                   ┌───────────────────────────┐
