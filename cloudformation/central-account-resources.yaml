@@ -1,7 +1,8 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: |
-  DevSecOps - PR-Based Security Scanning v3.2
+  DevSecOps - PR-Based Security Scanning v3.5
   Central Account Resources - Centralized Metadata Onboarding
+  v3.5: Removed SSM parameter for allowed branches (filtering done at EventBridge level)
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -23,10 +24,6 @@ Metadata:
           - SonarQubeHostUrl
           - SonarQubeIpCidr
           - SonarQubePort
-      - Label:
-          default: "Branch Configuration"
-        Parameters:
-          - AllowedBranches
       - Label:
           default: "Naming & Tags"
         Parameters:
@@ -55,11 +52,6 @@ Parameters:
   PrivateSubnetIds:
     Type: List<AWS::EC2::Subnet::Id>
     Description: Private subnet IDs for CodeBuild (must have NAT Gateway for internet access)
-
-  AllowedBranches:
-    Type: String
-    Description: Comma-separated list of destination branches that trigger PR scans.
-    Default: "main,uat,master"
 
   SonarQubeToken:
     Type: String
@@ -322,9 +314,6 @@ Resources:
         Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
         PrivilegedMode: false
         EnvironmentVariables:
-          - Name: ALLOWED_BRANCHES_PARAM
-            Value: /pr-scan/allowed-branches
-            Type: PLAINTEXT
           - Name: SONAR_SECRET_ARN
             Value: !Ref SonarQubeSecret
             Type: PLAINTEXT
@@ -345,7 +334,7 @@ Resources:
         - Key: Purpose
           Value: PR-Based Security Scanning
         - Key: Version
-          Value: "3.2"
+          Value: "3.5"
 
   CodeBuildLogGroup:
     Type: AWS::Logs::LogGroup
@@ -411,13 +400,6 @@ Resources:
               ArnLike:
                 ec2:Subnet:
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/*"
-          - Sid: SSMParameter
-            Effect: Allow
-            Action:
-              - ssm:GetParameter
-              - ssm:GetParameters
-            Resource:
-              - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/pr-scan/*"
           - Sid: SecretsManager
             Effect: Allow
             Action:
@@ -498,19 +480,6 @@ Resources:
           Value: "3.0"
 
   # ============================================================================
-  # SSM PARAMETER - Allowed Branches
-  # ============================================================================
-  AllowedBranchesParameter:
-    Type: AWS::SSM::Parameter
-    Properties:
-      Name: /pr-scan/allowed-branches
-      Description: Comma-separated list of branches that trigger PR scans.
-      Type: String
-      Value: !Ref AllowedBranches
-      Tags:
-        Purpose: PR-Based Security Scanning
-
-  # ============================================================================
   # SECRETS MANAGER - SonarQube Credentials
   # ============================================================================
   SonarQubeSecret:
@@ -578,7 +547,7 @@ Outputs:
 
   SolutionVersion:
     Description: Solution version
-    Value: "3.2"
+    Value: "3.5"
 
   SetupInstructions:
     Description: Setup instructions

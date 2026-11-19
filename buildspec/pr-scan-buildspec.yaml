@@ -1,7 +1,11 @@
 version: 0.2
-# DevSecOps - PR Security Scan v3.4
+# DevSecOps - PR Security Scan v3.5
 # Uses Self-Hosted SonarQube Enterprise with Advanced Security
 # Full Scan: SAST + SCA + Secrets (SBOM via SonarQube Advanced Security)
+#
+# v3.5: Removed branch filtering from buildspec (handled by EventBridge)
+#       - Branch filtering now done at EventBridge level in app-account
+#       - Reduces one SSM call per build
 #
 # v3.4: Configurable logging with LOG_LEVEL
 #       - LOG_LEVEL: ERROR (minimal) | INFO (default) | DEBUG (verbose)
@@ -43,7 +47,7 @@ phases:
         LOGGER_EOF
         source /tmp/logger.sh
         
-        log_info "=== PR Security Scan v3.4 ==="
+        log_info "=== PR Security Scan v3.5 ==="
         
         # Fetch SonarQube credentials from Secrets Manager
         log_debug "Fetching SonarQube credentials from Secrets Manager..."
@@ -96,23 +100,6 @@ phases:
         export SOURCE_BRANCH_CLEAN=$(echo "$SOURCE_BRANCH" | sed 's|refs/heads/||')
         export DEST_BRANCH_CLEAN=$(echo "$DEST_BRANCH" | sed 's|refs/heads/||')
         log_info "PR #${PR_ID}: ${SOURCE_BRANCH_CLEAN} → ${DEST_BRANCH_CLEAN}"
-        
-        # Check allowed branches
-        log_debug "Checking allowed branches..."
-        ALLOWED_BRANCHES=$(aws ssm get-parameter --name "${ALLOWED_BRANCHES_PARAM:-/pr-scan/allowed-branches}" --query 'Parameter.Value' --output text 2>/dev/null || echo "main,uat,master")
-        log_debug "Allowed branches: $ALLOWED_BRANCHES"
-        BRANCH_ALLOWED="false"
-        IFS=',' read -ra BRANCH_LIST <<< "$ALLOWED_BRANCHES"
-        for branch in "${BRANCH_LIST[@]}"; do
-          [ "$(echo $branch | xargs)" = "$DEST_BRANCH_CLEAN" ] && BRANCH_ALLOWED="true" && break
-        done
-        
-        if [ "$BRANCH_ALLOWED" = "false" ]; then
-          log_info "[SKIP] Branch '$DEST_BRANCH_CLEAN' not in allowed list"
-          echo "SKIP" > /tmp/scan_status
-          echo "BRANCH_NOT_ALLOWED" > /tmp/skip_reason
-          exit 0
-        fi
         
         export SCAN_TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
         export SCAN_START_TIME=$(date +%s)
@@ -640,7 +627,7 @@ phases:
         echo "| [📦 Dependencies](${SONAR_HOST_URL}/project/dependencies?id=${PROJECT_KEY}&branch=${SOURCE_BRANCH_CLEAN}) | Dependency analysis & SBOM |" >> /tmp/pr_comment.md
         echo "" >> /tmp/pr_comment.md
         echo "---" >> /tmp/pr_comment.md
-        echo "🤖 **DevSecOps v3.4** | \`$CORRELATION_ID\` | $TIMESTAMP" >> /tmp/pr_comment.md
+        echo "🤖 **DevSecOps v3.5** | \`$CORRELATION_ID\` | $TIMESTAMP" >> /tmp/pr_comment.md
         
         # Post comment to CodeCommit
         log_debug "Posting PR comment..."
@@ -661,7 +648,7 @@ phases:
           
           # Generate pr-scan-report.json
           jq -n \
-            --arg schemaVersion "3.4" \
+            --arg schemaVersion "3.5" \
             --arg correlationId "$CORRELATION_ID" \
             --arg appId "$APP_ID" \
             --arg appName "$APP_NAME" \
